@@ -1,0 +1,54 @@
+# Zorv client example config (zorv)
+#
+# Copy to zorv.toml and adjust for your environment.
+# Supports TCP port forwarding, UDP proxying and traffic obfuscation
+# (padding / heartbeat jitter). No ja3_profile support.
+
+# Unique client identifier; the server routes proxy traffic by this id
+# (must match proxies[].client_id configured on the server).
+client_id = "home-nas"
+
+# Server tunnel address (host:port).
+server_addr = "your-server.example.com:8443"
+
+[auth]
+# Pre-shared token; must match the server.
+token = "your-strong-pre-shared-token-here"
+
+[tls]
+# Whether to verify the server certificate. Production must set true and
+# provide a trusted ca_file. Disable only for self-signed testing (MITM risk).
+verify_cert = true
+# Custom CA file path (required when verify_cert = true).
+# ca_file = "/etc/zorv/ca.crt"
+
+# The client does not need to declare proxy rules: the forwarding target
+# (intranet service) is configured in the server's web console (/settings.html);
+# the server sends the target in a STREAM_OPEN frame and the client connects
+# to the local target accordingly.
+# To keep local declarations (compat with old configs), use the following form:
+# [[proxies]]
+# name   = "web"
+# type   = "tcp"
+# target = "127.0.0.1:8080"
+
+[reconnect]
+initial_delay  = "2s"
+max_delay      = "60s"
+backoff_factor = 2.0
+# Maximum retry count; 0 means reconnect forever.
+max_retries    = 0
+
+# Traffic obfuscation: random padding flattens packet-length distribution and
+# heartbeat jitter avoids a fixed periodic signature.
+[obfuscation]
+# Whether to enable random padding (0..padding_max bytes). Set false for low latency.
+padding          = true
+# Maximum padding bytes per frame.
+padding_max      = 255
+# Whether to jitter the heartbeat interval (enabled by default).
+heartbeat_jitter = true
+
+[log]
+level  = "info"
+output = "./app.log"

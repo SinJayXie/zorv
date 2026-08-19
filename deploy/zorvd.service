@@ -1,0 +1,46 @@
+# systemd service unit: Zorv tunnel server daemon
+#
+# Installation steps:
+#   1) sudo useradd --system --home /var/lib/zorv --create-home --shell /usr/sbin/nologin zorv
+#   2) sudo install -m 644 releases/zorvd /usr/local/bin/zorvd
+#   3) sudo mkdir -p /etc/zorv && sudo install -m 644 config/zorvd.example.toml /etc/zorv/zorvd.toml
+#      edit /etc/zorv/zorvd.toml: set token, cert paths and data_dir = "/var/lib/zorv"
+#   4) sudo install -m 644 deploy/zorvd.service /etc/systemd/system/zorvd.service
+#   5) sudo systemctl daemon-reload && sudo systemctl enable --now zorvd
+#
+# Common commands:
+#   systemctl status zorvd / journalctl -u zorvd -f / systemctl restart zorvd
+
+[Unit]
+Description=Zorv tunnel server daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zorv
+Group=zorv
+# Config file path (--config, default zorvd.toml)
+ExecStart=/usr/local/bin/zorvd --config /etc/zorv/zorvd.toml
+Restart=on-failure
+RestartSec=3
+# High concurrency tunnel/agent connections need more file descriptors
+#LimitNOFILE=65536
+# Auto create and own /var/lib/zorv to zorv user (config data_dir must point to it)
+StateDirectory=zorv
+# Allow binding to ports below 1024 (like 80/443), keep if needed
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Zorv Console · Online Clients</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* Mobile (<640px): the table becomes stacked cards, with field names shown inline via data-label */
+    @media (max-width: 640px) {
+      #client-table thead { display: none; }
+      #client-table, #client-table tbody, #client-table tr, #client-table td { display: block; width: 100%; }
+      #client-table tr { border-top: 1px solid #e2e8f0; padding: 0.5rem 0; }
+      #client-table td {
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 0.75rem; padding: 0.4rem 0.75rem; text-align: right;
+      }
+      #client-table td::before {
+        content: attr(data-label);
+        font-weight: 500; color: #94a3b8; text-align: left; flex-shrink: 0;
+      }
+      #client-table tr:first-child td:first-child { padding-top: 0.75rem; }
+      #client-table td.table-empty { display: block; text-align: center; padding: 2rem 0.75rem; }
+    }
+  </style>
+</head>
+<body class="bg-slate-100 min-h-screen text-slate-800">
+  <nav class="bg-slate-800 text-white shadow">
+    <div class="max-w-5xl mx-auto px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm sm:text-base">
+      <span class="font-bold text-lg tracking-wide mr-auto">Zorv Console</span>
+      <a href="/index.html" class="text-slate-300 hover:text-white">Overview</a>
+      <a href="/clients.html" class="text-white border-b-2 border-white pb-0.5">Online Clients</a>
+      <a href="/settings.html" class="text-slate-300 hover:text-white">Settings</a>
+      <a href="/traffic.html" class="text-slate-300 hover:text-white">Traffic</a>
+      <a href="#" onclick="logout(event)" class="text-slate-300 hover:text-white">Logout</a>
+    </div>
+  </nav>
+
+  <main class="max-w-5xl mx-auto px-4 py-6 sm:py-8">
+    <div class="flex items-center justify-between mb-4 sm:mb-6">
+      <h1 class="text-xl sm:text-2xl font-semibold">Online Clients</h1>
+      <button onclick="load()" class="text-sm bg-slate-800 text-white px-4 py-2 rounded-lg hover:bg-slate-700">Refresh</button>
+    </div>
+
+    <div class="bg-white rounded-xl shadow-sm overflow-hidden">
+      <table id="client-table" class="w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-left">
+          <tr>
+            <th class="px-4 py-3 font-medium">Client ID</th>
+            <th class="px-4 py-3 font-medium">Session ID</th>
+            <th class="px-4 py-3 font-medium">Active Streams</th>
+            <th class="px-4 py-3 font-medium">Last Activity</th>
+            <th class="px-4 py-3 font-medium">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="5" class="px-4 py-8 text-center text-slate-400 table-empty">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </main>
+
+  <script>
+    function esc(s) {
+      if (s === null || s === undefined) return '';
+      return String(s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[c]));
+    }
+    function fmt(ms) {
+      if (!ms) return '-';
+      const ago = Date.now() - ms;
+      return Math.max(0, Math.round(ago / 1000)) + 's 前';
+    }
+    async function load() {
+      const rows = document.getElementById('rows');
+      try {
+        const r = await fetch('/api/clients');
+        if (r.status === 401) { location.href = '/login.html'; return; }
+        const list = await r.json();
+        if (!list.length) {
+          rows.innerHTML = '<tr><td colspan="5" class="px-4 py-8 text-center text-slate-400 table-empty">No online clients found</td></tr>';
+          return;
+        }
+        rows.innerHTML = list.map(c =>
+          '<tr class="border-t border-slate-100">' +
+            '<td data-label="Client ID" class="px-4 py-3 font-mono break-all">' + esc(c.client_id) + '</td>' +
+            '<td data-label="Session ID" class="px-4 py-3 font-mono text-slate-500 break-all">' + esc(c.session_id) + '</td>' +
+            '<td data-label="Active Streams" class="px-4 py-3">' + c.active_streams + '</td>' +
+            '<td data-label="Last Activity" class="px-4 py-3 text-slate-500">' + fmt(c.last_activity_ms) + '</td>' +
+            '<td data-label="Actions" class="px-4 py-3">' +
+              '<button data-kick data-client-id="' + esc(c.client_id) + '" class="text-xs bg-red-50 text-red-600 border border-red-200 px-2 py-1 rounded hover:bg-red-100">踢出</button>' +
+            '</td>' +
+          '</tr>'
+        ).join('');
+      } catch (e) {
+        rows.innerHTML = '<tr><td colspan="5" class="px-4 py-8 text-center text-red-400 table-empty">Loading failed</td></tr>';
+      }
+    }
+    async function kick(clientId) {
+      if (!confirm('Kick client ' + clientId + ' ?')) return;
+      try {
+        const r = await fetch('/api/kick', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ client_id: clientId })
+        });
+        if (r.status === 401) { location.href = '/login.html'; return; }
+        const j = await r.json();
+        if (!j.ok) { alert('Kick failed: ' + (j.error || r.status)); return; }
+        load();
+      } catch (e) {
+        alert('Kick failed');
+      }
+    }
+    // Event delegation: read raw values via data-* attributes to avoid splicing user-controlled data into inline JS
+    document.getElementById('rows').addEventListener('click', function (e) {
+      const btn = e.target.closest('[data-kick]');
+      if (!btn) return;
+      kick(btn.dataset.clientId);
+    });
+
+    async function logout(e) {
+      e.preventDefault();
+      try { await fetch('/api/logout', { method: 'POST' }); } catch (err) {}
+      location.href = '/login.html';
+    }
+    load();
+    setInterval(load, 5000);
+  </script>
+</body>
+</html>
