@@ -318,8 +318,8 @@ onMounted(() => {
               <p class="text-sm text-slate-500 font-mono mt-1 break-all">{{ rule.listen }} → {{ rule.target }}</p>
             </div>
             <div class="flex items-center gap-3 shrink-0">
-              <button class="text-slate-500 hover:text-slate-700 text-xs" @click="openProxyModal(group.clientId, rule)">编辑</button>
-              <button class="text-red-500 hover:text-red-700 text-xs" @click="deleteProxy(rule.name)">删除</button>
+              <button class="text-slate-500 hover:text-slate-700 text-xs" @click="openProxyModal(group.clientId, rule)">Edit</button>
+              <button class="text-red-500 hover:text-red-700 text-xs" @click="deleteProxy(rule.name)">Delete</button>
             </div>
           </div>
         </div>

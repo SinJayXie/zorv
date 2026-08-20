@@ -10,7 +10,7 @@ const error = ref('')
 function fmtAgo(ms?: number): string {
   if (!ms) return '-'
   const ago = Date.now() - ms
-  return Math.max(0, Math.round(ago / 1000)) + 's 前'
+  return Math.max(0, Math.round(ago / 1000)) + 's ago'
 }
 
 async function load() {
@@ -72,7 +72,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
             <td data-label="Active Streams" class="px-4 py-3">{{ c.active_streams }}</td>
             <td data-label="Last Activity" class="px-4 py-3 text-slate-500">{{ fmtAgo(c.last_activity_ms) }}</td>
             <td data-label="Actions" class="px-4 py-3">
-              <button class="text-xs bg-red-50 text-red-600 border border-red-200 px-2 py-1 rounded hover:bg-red-100" @click="kick(c.client_id)">踢出</button>
+              <button class="text-xs bg-red-50 text-red-600 border border-red-200 px-2 py-1 rounded hover:bg-red-100" @click="kick(c.client_id)">Kick</button>
             </td>
           </tr>
         </tbody>
