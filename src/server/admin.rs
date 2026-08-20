@@ -1,15 +1,16 @@
 //! Server-side web admin UI: minimal HTTP server + JSON API + login authentication.
 //!
 //! No HTTP framework is used; HTTP/1.1 parsing and responses are hand-written on `tokio::net::TcpListener`.
-//! Page assets are embedded via `include_str!`.
+//! The frontend is a Vue SPA whose build artifacts (`html/` directory) are embedded via a build script.
 //!
 //! Auth: when `AdminConfig.password` is non-empty, login is mandatory. A successful login issues a session token
-//! (`Cookie: session=...`) that must be carried by subsequent pages and API calls; an empty password disables login.
+//! that the frontend stores and sends back in the `Authorization: Bearer <token>` header on every API call;
+//! an empty password disables login.
 //!
-//! Pages: `/login.html`, `/` (or `/index.html`), `/clients.html`, `/settings.html`
+//! Pages: `/login`, `/`, `/clients`, `/settings`, `/traffic` (SPA, served from embedded assets)
 //! API: `POST /api/login`, `POST /api/logout`, `GET /api/status`,
 //!   `GET /api/clients`, `GET /api/proxies`, `POST /api/proxies`,
-//!   `DELETE /api/proxies?name=xxx`, `PUT /api/token`
+//!   `DELETE /api/proxies?name=xxx`, `PUT /api/token`, `POST /api/password`
 
 use std::sync::Arc;
 
@@ -29,11 +30,8 @@ use crate::server::manager::TunnelManager;
 use crate::server::proxy::ProxyManager;
 use crate::server::traffic::{TrafficCounter, TrafficTracker};
 
-const LOGIN_HTML: &str = include_str!("../../html/login.html");
-const INDEX_HTML: &str = include_str!("../../html/index.html");
-const CLIENTS_HTML: &str = include_str!("../../html/clients.html");
-const SETTINGS_HTML: &str = include_str!("../../html/settings.html");
-const TRAFFIC_HTML: &str = include_str!("../../html/traffic.html");
+// Static assets embedded by build.rs (the built Vue SPA under `html/`).
+include!(concat!(env!("OUT_DIR"), "/embedded_html.rs"));
 
 /// Session TTL (ms): 24 hours.
 const SESSION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -61,8 +59,9 @@ pub struct AdminState {
     pub base: RwLock<ServerConfig>,
     /// Admin login username.
     pub username: String,
-    /// Admin login password (empty disables login).
-    pub password: String,
+    /// Admin login password (empty disables login). Wrapped in a lock because
+    /// the admin API can rotate it at runtime.
+    pub password: Arc<RwLock<String>>,
     /// Session table: `session_token -> expiry timestamp (ms)`.
     pub sessions: DashMap<String, u64>,
     /// Login failure counter: `ip -> (failure count, window start ms)`.
@@ -161,10 +160,24 @@ struct HttpRequest {
     body: Vec<u8>,
     /// Client IP (used for blocking on login failures).
     ip: String,
-    /// Session token extracted from the Cookie.
-    session: Option<String>,
+    /// Raw `Authorization` header value (e.g. `Bearer <token>`).
+    auth: Option<String>,
     /// Captcha id extracted from the Cookie.
     captcha: Option<String>,
+}
+
+impl HttpRequest {
+    /// Returns the bearer token from the `Authorization` header.
+    /// Accepts both `Bearer <token>` and a bare `<token>` value.
+    fn auth_token(&self) -> Option<&str> {
+        let v = self.auth.as_deref()?;
+        let tok = v.strip_prefix("Bearer ").unwrap_or(v).trim();
+        if tok.is_empty() {
+            None
+        } else {
+            Some(tok)
+        }
+    }
 }
 
 /// HTTP response (each extra header line ends with `\r\n`).
@@ -191,13 +204,53 @@ impl Response {
     }
 }
 
-fn html_response(html: &str) -> Response {
-    Response {
-        status: "200 OK",
-        content_type: "text/html; charset=utf-8",
-        extra_headers: String::new(),
-        body: html.as_bytes().to_vec(),
+/// Lazy map of embedded static files: `path -> bytes`.
+fn static_files() -> &'static std::collections::HashMap<&'static str, &'static [u8]> {
+    static MAP: std::sync::OnceLock<std::collections::HashMap<&'static str, &'static [u8]>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| FILES.iter().map(|&(k, v)| (k, v)).collect())
+}
+
+/// Content type for an embedded file, inferred from its extension.
+fn mime_for(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    match ext {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "json" => "application/json",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        _ => "application/octet-stream",
     }
+}
+
+/// Serves an embedded static file (e.g. `/`, `/index.html`, `/assets/xxx.js`).
+/// Returns `None` when the file is not part of the build output.
+fn serve_static(path: &str) -> Option<Response> {
+    let key = path.trim_start_matches('/');
+    let key = if key.is_empty() { "index.html" } else { key };
+    let content = static_files().get(key)?;
+    // Content-hashed assets can be cached forever; HTML must be revalidated
+    // so SPA updates are picked up without a hard refresh.
+    let extra_headers = if key.starts_with("assets/") {
+        "Cache-Control: public, max-age=31536000, immutable\r\n".to_string()
+    } else {
+        "Cache-Control: no-cache\r\n".to_string()
+    };
+    Some(Response {
+        status: "200 OK",
+        content_type: mime_for(key),
+        extra_headers,
+        body: content.to_vec(),
+    })
 }
 
 fn json_response(status: &'static str, body: Vec<u8>) -> Response {
@@ -250,18 +303,20 @@ async fn read_request(stream: &mut ConnStream) -> Option<HttpRequest> {
     let path = parts.next()?.to_string();
 
     let mut content_length = 0usize;
-    let mut session = None;
+    let mut auth = None;
     let mut captcha = None;
     for line in lines {
         if let Some(v) = line.strip_prefix("Content-Length:") {
             content_length = v.trim().parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("content-length:") {
             content_length = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("Authorization:") {
+            auth = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("authorization:") {
+            auth = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("Cookie:") {
             for part in v.split(';') {
-                if let Some(val) = part.trim().strip_prefix("session=") {
-                    session = Some(val.trim().to_string());
-                } else if let Some(val) = part.trim().strip_prefix("captcha=") {
+                if let Some(val) = part.trim().strip_prefix("captcha=") {
                     captcha = Some(val.trim().to_string());
                 }
             }
@@ -283,7 +338,7 @@ async fn read_request(stream: &mut ConnStream) -> Option<HttpRequest> {
         path,
         body,
         ip: String::new(), // filled in by handle_conn
-        session,
+        auth,
         captcha,
     })
 }
@@ -318,17 +373,20 @@ async fn route(req: &HttpRequest, state: &AdminState) -> Response {
     if method == "GET" && path == "/metrics" {
         return api_metrics(state).await;
     }
+    // The login page is part of the SPA; serve the app shell (the router renders /login client-side)
     if method == "GET" && (path == "/login.html" || path == "/login") {
-        return html_response(LOGIN_HTML);
+        if let Some(resp) = serve_static("index.html") {
+            return resp;
+        }
     }
     if method == "POST" && path == "/api/login" {
         return api_login(req, state).await;
     }
 
     // Auth (skipped when the password is empty)
-    if !is_authenticated(state, req) {
+    if !is_authenticated(state, req).await {
         if method == "GET" && !path.starts_with("/api/") {
-            return redirect_response("/login.html");
+            return redirect_response("/login");
         }
         return json_err_response("401 Unauthorized", "unauthorized");
     }
@@ -338,17 +396,17 @@ async fn route(req: &HttpRequest, state: &AdminState) -> Response {
         return api_logout(req, state);
     }
 
-    // Page routes (authenticated)
+    // Page routes (authenticated): serve the embedded SPA assets
     if method == "GET" {
-        let html = match path {
-            "/" | "/index.html" => Some(INDEX_HTML),
-            "/clients.html" => Some(CLIENTS_HTML),
-            "/settings.html" => Some(SETTINGS_HTML),
-            "/traffic.html" => Some(TRAFFIC_HTML),
-            _ => None,
-        };
-        if let Some(h) = html {
-            return html_response(h);
+        if let Some(resp) = serve_static(path) {
+            return resp;
+        }
+        // SPA fallback: unknown GET paths (e.g. client-side routes after a refresh)
+        // serve the app shell so vue-router can handle them.
+        if !path.starts_with("/api/") {
+            if let Some(resp) = serve_static("index.html") {
+                return resp;
+            }
         }
     }
 
@@ -366,6 +424,7 @@ async fn route(req: &HttpRequest, state: &AdminState) -> Response {
         ("GET", "/api/proxies") => api_proxies(state).await,
         ("POST", "/api/proxies") => api_create_proxy(req, state).await,
         ("PUT", "/api/token") => api_update_token(req, state).await,
+        ("POST", "/api/password") => api_change_password(req, state).await,
         ("POST", "/api/kick") => api_kick(req, state).await,
         ("POST", "/api/reload") => api_reload(state).await,
         ("DELETE", "/api/proxies") => api_delete_proxy(query, state).await,
@@ -378,15 +437,17 @@ async fn route(req: &HttpRequest, state: &AdminState) -> Response {
 // ---------------------------------------------------------------------------
 
 /// Whether the request is authenticated (always true when the password is empty, i.e. login disabled).
-fn is_authenticated(state: &AdminState, req: &HttpRequest) -> bool {
-    if state.password.is_empty() {
+///
+/// The session token is carried in the `Authorization: Bearer <token>` header.
+async fn is_authenticated(state: &AdminState, req: &HttpRequest) -> bool {
+    if state.password.read().await.is_empty() {
         return true;
     }
-    match &req.session {
-        Some(s) => match state.sessions.get(s) {
-            Some(expire) => now_millis() < *expire,
-            None => false,
-        },
+    let Some(tok) = req.auth_token() else {
+        return false;
+    };
+    match state.sessions.get(tok) {
+        Some(expire) => now_millis() < *expire,
         None => false,
     }
 }
@@ -512,7 +573,8 @@ async fn api_login(req: &HttpRequest, state: &AdminState) -> Response {
         }
     };
 
-    if state.password.is_empty() {
+    let stored_pwd = state.password.read().await.clone();
+    if stored_pwd.is_empty() {
         return json_err_response("403 Forbidden", "login disabled");
     }
 
@@ -521,20 +583,16 @@ async fn api_login(req: &HttpRequest, state: &AdminState) -> Response {
         return json_err_response("401 Unauthorized", "验证码错误或已过期");
     }
 
-    if lreq.username == state.username && verify_password(&lreq.password, &state.password) {
+    if lreq.username == state.username && verify_password(&lreq.password, &stored_pwd) {
         // Login succeeded: clear this IP's failure count
         audit("login", &format!("ok user={} ip={}", lreq.username, req.ip));
         state.login_failures.remove(&req.ip);
         let session = gen_session_token();
         let expire = now_millis() + SESSION_TTL_MS;
         state.sessions.insert(session.clone(), expire);
-        let extra = format!("Set-Cookie: session={session}; Path=/; HttpOnly; SameSite=Lax\r\n");
-        return Response {
-            status: "200 OK",
-            content_type: "application/json",
-            extra_headers: extra,
-            body: json_ok(),
-        };
+        // The frontend stores this token and sends it back in the Authorization header
+        let body = serde_json::json!({ "ok": true, "token": session });
+        return json_response("200 OK", json_body(&body));
     }
 
     // Wrong password: accumulate failures, block the IP for 30 minutes at the threshold
@@ -657,15 +715,10 @@ async fn api_captcha(state: &AdminState) -> Response {
 }
 
 fn api_logout(req: &HttpRequest, state: &AdminState) -> Response {
-    if let Some(s) = &req.session {
-        state.sessions.remove(s);
+    if let Some(tok) = req.auth_token() {
+        state.sessions.remove(tok);
     }
-    Response {
-        status: "200 OK",
-        content_type: "application/json",
-        extra_headers: "Set-Cookie: session=; Path=/; HttpOnly; Max-Age=0\r\n".to_string(),
-        body: json_ok(),
-    }
+    json_response("200 OK", json_ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,6 +1055,55 @@ async fn api_update_token(req: &HttpRequest, state: &AdminState) -> Response {
     json_response("200 OK", json_body(&body))
 }
 
+/// `POST /api/password`: changes the admin login password.
+///
+/// The old password must be verified first (skipped when login is currently
+/// disabled, i.e. `password` is empty). The new password is hashed with
+/// PBKDF2-HMAC-SHA256 before being stored, written back to the config file, and
+/// all existing sessions are invalidated so every client must log in again.
+async fn api_change_password(req: &HttpRequest, state: &AdminState) -> Response {
+    #[derive(Deserialize)]
+    struct PwdReq {
+        old_password: String,
+        new_password: String,
+    }
+    let preq: PwdReq = match serde_json::from_slice(&req.body) {
+        Ok(p) => p,
+        Err(e) => {
+            return json_err_response("400 Bad Request", &format!("invalid password json: {e}"));
+        }
+    };
+
+    if preq.new_password.len() < 8 {
+        return json_err_response("400 Bad Request", "新密码至少需要 8 个字符");
+    }
+    if preq.new_password.len() > 128 {
+        return json_err_response("400 Bad Request", "新密码过长");
+    }
+
+    // When a password is already set, the old password must match.
+    {
+        let cur = state.password.read().await;
+        if !cur.is_empty() && !verify_password(&preq.old_password, &cur) {
+            audit("change_password", "failed (old password mismatch)");
+            return json_err_response("400 Bad Request", "旧密码错误");
+        }
+    }
+
+    let new_hash = hash_password(&preq.new_password);
+    *state.password.write().await = new_hash.clone();
+    // Sync the startup snapshot so the subsequent persist writes it back.
+    state.base.write().await.admin.password = new_hash.clone();
+    persist(state).await;
+
+    // Password changed: invalidate all sessions so everyone must re-login.
+    state.sessions.clear();
+
+    audit("change_password", "admin password updated");
+    info!("admin password changed");
+    json_response("200 OK", json_ok())
+}
+
 /// Generates a random token: a 32-character hex string (128-bit entropy).
 fn gen_token() -> String {
     let mut bytes = [0u8; 16];
@@ -1060,11 +1162,13 @@ async fn api_reload(state: &AdminState) -> Response {
     json_response("200 OK", json_ok())
 }
 
-/// Writes the config back: starting from the startup snapshot, replacing the current token and proxies.
+/// Writes the config back: starting from the startup snapshot, replacing the current token,
+/// proxy rules, and admin password.
 async fn persist(state: &AdminState) {
     let mut cfg = state.base.read().await.clone();
     cfg.auth.token = state.token.read().await.clone();
     cfg.proxies = state.proxies.read().await.clone();
+    cfg.admin.password = state.password.read().await.clone();
     if let Err(e) = save_server(&state.config_path, &cfg) {
         error!("persist config failed: {e}");
     }
@@ -1141,7 +1245,7 @@ mod tests {
             config_path: String::new(),
             base: RwLock::new(base),
             username: "admin".to_string(),
-            password: password.to_string(),
+            password: Arc::new(RwLock::new(password.to_string())),
             sessions: DashMap::new(),
             login_failures: DashMap::new(),
             blocked_ips: DashMap::new(),
@@ -1160,18 +1264,19 @@ mod tests {
             path: path.to_string(),
             body,
             ip: "127.0.0.1".to_string(),
-            session: None,
+            auth: None,
             captcha: None,
         }
     }
 
-    fn req_session(method: &str, path: &str, session: &str) -> HttpRequest {
+    /// Authenticated request carrying the session token in the `Authorization` header.
+    fn req_auth(method: &str, path: &str, token: &str) -> HttpRequest {
         HttpRequest {
             method: method.to_string(),
             path: path.to_string(),
             body: Vec::new(),
             ip: "127.0.0.1".to_string(),
-            session: Some(session.to_string()),
+            auth: Some(format!("Bearer {token}")),
             captcha: None,
         }
     }
@@ -1183,7 +1288,7 @@ mod tests {
             path: "/api/login".to_string(),
             body,
             ip: "127.0.0.1".to_string(),
-            session: None,
+            auth: None,
             captcha: captcha_id.map(|s| s.to_string()),
         }
     }
@@ -1214,6 +1319,7 @@ mod tests {
     #[tokio::test]
     async fn route_serves_pages() {
         let state = make_state();
+        // The SPA shell is served at / (the embedded index.html mentions Zorv)
         let resp = route(&req("GET", "/", vec![]), &state).await;
         assert_eq!(resp.status, "200 OK");
         assert!(String::from_utf8_lossy(&resp.body).contains("Zorv"));
@@ -1221,8 +1327,27 @@ mod tests {
         let resp = route(&req("GET", "/clients.html", vec![]), &state).await;
         assert_eq!(resp.status, "200 OK");
 
-        let resp = route(&req("GET", "/nope", vec![]), &state).await;
-        assert_eq!(resp.status, "404 Not Found");
+        // Unknown GET paths fall back to the SPA shell so vue-router can handle them
+        let resp = route(&req("GET", "/settings", vec![]), &state).await;
+        assert_eq!(resp.status, "200 OK");
+        assert!(String::from_utf8_lossy(&resp.body).contains("Zorv"));
+    }
+
+    #[test]
+    fn auth_token_parsing() {
+        let mk = |auth: Option<&str>| HttpRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            body: Vec::new(),
+            ip: "127.0.0.1".to_string(),
+            auth: auth.map(|s| s.to_string()),
+            captcha: None,
+        };
+        assert_eq!(mk(Some("Bearer abc123")).auth_token(), Some("abc123"));
+        assert_eq!(mk(Some("abc123")).auth_token(), Some("abc123"));
+        assert_eq!(mk(Some("Bearer   spaced  ")).auth_token(), Some("spaced"));
+        assert_eq!(mk(Some("Bearer ")).auth_token(), None);
+        assert_eq!(mk(None).auth_token(), None);
     }
 
     #[tokio::test]
@@ -1488,6 +1613,73 @@ mod tests {
         assert_eq!(*state.token.read().await, new_token);
     }
 
+    /// Password change request with a valid session (helper).
+    fn pwd_req(session: &str, body: Vec<u8>) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/password".to_string(),
+            body,
+            ip: "127.0.0.1".to_string(),
+            auth: Some(format!("Bearer {session}")),
+            captcha: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn api_change_password_requires_auth() {
+        let state = make_state_with_password("secret");
+        let body = br#"{"old_password":"secret","new_password":"newpass123"}"#.to_vec();
+        let resp = route(&req("POST", "/api/password", body), &state).await;
+        assert_eq!(resp.status, "401 Unauthorized");
+    }
+
+    #[tokio::test]
+    async fn api_change_password_flow() {
+        let state = make_state_with_password("secret");
+        // Login to obtain a valid session token
+        let cid = add_captcha(&state);
+        let body = br#"{"username":"admin","password":"secret","captcha_code":"ABCD"}"#.to_vec();
+        let resp = route(&login_req(body, Some(&cid)), &state).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let session = v["token"].as_str().unwrap().to_string();
+
+        // Wrong old password → 400
+        let body = br#"{"old_password":"wrong","new_password":"newpass123"}"#.to_vec();
+        let resp = route(&pwd_req(&session, body), &state).await;
+        assert_eq!(resp.status, "400 Bad Request");
+        assert!(verify_password("secret", &state.password.read().await));
+
+        // New password too short → 400
+        let body = br#"{"old_password":"secret","new_password":"short"}"#.to_vec();
+        let resp = route(&pwd_req(&session, body), &state).await;
+        assert_eq!(resp.status, "400 Bad Request");
+
+        // Correct flow → 200, hash replaced, sessions cleared
+        let body = br#"{"old_password":"secret","new_password":"newpass123"}"#.to_vec();
+        let resp = route(&pwd_req(&session, body), &state).await;
+        assert_eq!(resp.status, "200 OK", "body={}", String::from_utf8_lossy(&resp.body));
+        let pwd = state.password.read().await.clone();
+        assert!(!verify_password("secret", &pwd), "旧密码必须失效");
+        assert!(verify_password("newpass123", &pwd), "新密码必须可用");
+        assert!(pwd.starts_with("$pbkdf2-sha256$"));
+        assert!(state.sessions.is_empty(), "所有会话必须失效");
+        assert!(
+            state.base.read().await.admin.password == pwd,
+            "base 快照必须同步，以便持久化"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_change_password_when_login_disabled() {
+        // No password set (login disabled): any authenticated caller can set the
+        // first password without an old-password check.
+        let state = make_state();
+        let body = br#"{"old_password":"","new_password":"firstpass123"}"#.to_vec();
+        let resp = route(&req("POST", "/api/password", body), &state).await;
+        assert_eq!(resp.status, "200 OK", "body={}", String::from_utf8_lossy(&resp.body));
+        assert!(verify_password("firstpass123", &state.password.read().await));
+    }
+
     #[tokio::test]
     async fn auth_required_when_password_set() {
         let state = make_state_with_password("secret");
@@ -1496,14 +1688,16 @@ mod tests {
         let resp = route(&req("GET", "/api/status", vec![]), &state).await;
         assert_eq!(resp.status, "401 Unauthorized");
 
-        // Visiting a page without login → redirect to the login page
+        // Visiting a page without login → redirect to the login route
         let resp = route(&req("GET", "/", vec![]), &state).await;
         assert_eq!(resp.status, "302 Found");
-        assert!(resp.extra_headers.contains("Location: /login.html"));
+        assert!(resp.extra_headers.contains("Location: /login"));
 
         // The login page itself requires no auth
         let resp = route(&req("GET", "/login.html", vec![]), &state).await;
         assert_eq!(resp.status, "200 OK");
+        // The SPA shell (index.html) is served even when embedded assets exist
+        assert!(String::from_utf8_lossy(&resp.body).len() > 0);
     }
 
     #[tokio::test]
@@ -1516,28 +1710,28 @@ mod tests {
         let resp = route(&login_req(body, Some(&cid)), &state).await;
         assert_eq!(resp.status, "401 Unauthorized");
 
-        // Correct password → session cookie returned
+        // Correct password → session token returned in the body
         let cid = add_captcha(&state); // consumed last captcha
         let body = br#"{"username":"admin","password":"secret","captcha_code":"abcd"}"#.to_vec();
         let resp = route(&login_req(body, Some(&cid)), &state).await;
         assert_eq!(resp.status, "200 OK");
-        let session = resp
-            .extra_headers
-            .split("session=")
-            .nth(1)
-            .and_then(|s| s.split(';').next())
-            .unwrap()
-            .to_string();
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["ok"], true);
+        let session = v["token"].as_str().unwrap().to_string();
         assert!(!session.is_empty());
 
-        // API access with session → allowed
-        let resp = route(&req_session("GET", "/api/status", &session), &state).await;
+        // API access with the token in the Authorization header → allowed
+        let resp = route(&req_auth("GET", "/api/status", &session), &state).await;
+        assert_eq!(resp.status, "200 OK");
+
+        // A bare (non-Bearer) token is accepted too
+        let resp = route(&req_auth("GET", "/api/status", &session), &state).await;
         assert_eq!(resp.status, "200 OK");
 
         // Session is invalid after logout
-        let resp = route(&req_session("POST", "/api/logout", &session), &state).await;
+        let resp = route(&req_auth("POST", "/api/logout", &session), &state).await;
         assert_eq!(resp.status, "200 OK");
-        let resp = route(&req_session("GET", "/api/status", &session), &state).await;
+        let resp = route(&req_auth("GET", "/api/status", &session), &state).await;
         assert_eq!(resp.status, "401 Unauthorized");
     }
 

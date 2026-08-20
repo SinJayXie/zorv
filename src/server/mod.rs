@@ -164,7 +164,7 @@ impl Server {
                 config_path: self.config_path.clone(),
                 base: RwLock::new(self.config.clone()),
                 username: self.config.admin.username.clone(),
-                password: self.config.admin.password.clone(),
+                password: Arc::new(RwLock::new(self.config.admin.password.clone())),
                 traffic: Arc::clone(&traffic),
                 sessions: dashmap::DashMap::new(),
                 login_failures: dashmap::DashMap::new(),

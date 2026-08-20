@@ -4,13 +4,24 @@
 # Build: docker build -f deploy/Dockerfile -t zorvd:latest .
 # Run: see deploy/README.md
 
+# ---- UI build stage (Vue admin console) ----
+FROM node:22-bookworm-slim AS ui-builder
+WORKDIR /ui
+COPY zorv-ui/package.json zorv-ui/pnpm-lock.yaml ./
+RUN corepack enable && pnpm install --frozen-lockfile
+COPY zorv-ui ./
+# Outputs the built SPA to /html (see vite.config.ts: outDir = '../html')
+RUN pnpm build
+
 # ---- Build stage ----
 FROM rust:1-bookworm AS builder
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY examples ./examples
 COPY config ./config
+# Embedded admin console assets (required by build.rs)
+COPY --from=ui-builder /html ./html
 # Full static dependencies (rustls pure Rust), can be copied directly
 RUN cargo build --release --bin zorvd --bin zorv
 

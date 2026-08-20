@@ -28,9 +28,9 @@
 - **TCP / UDP 代理**：同时支持端口转发与 UDP 数据报（如 DNS 转发）
 - **流量混淆**：随机 padding 抹平包长分布、心跳间隔随机抖动（`[obfuscation]`）
 - **多客户端**：`client_id` 路由，代理规则与具体客户端绑定
-- **Web 管理台**：在线客户端/总览/设置/流量监控四个页面，移动端自适应
+- **Web 管理台**：Vue 3 SPA（TypeScript + Vite + Tailwind + Pinia + vue-router + axios），在线客户端/总览/设置/流量监控四个页面，移动端自适应，认证走 `Authorization: Bearer <token>` header
   - 图形验证码 + 防爆破（单 IP 连续 5 次密码错误锁定 30 分钟）
-  - 应用 Token 管理（支持随机生成 / 复制）、代理规则可视化增删改（弹窗表单 + 输入校验）
+  - 应用 Token 管理（支持随机生成 / 复制）、代理规则可视化增删改（弹窗表单 + 输入校验）、修改密码（校验旧密码、强制重新登录）
   - 在线客户端列表 + 一键踢出（踢出后客户端退出）
   - 流量监控：按 `client_id` 的 TCP/UDP 上行/下行统计，**落盘持久化** + 30s 采样时序曲线（Canvas 手绘，近 100 分钟）
   - 配置热重载：编辑服务端 `zorvd.toml` 后免重启生效（token 与代理规则差异应用）
@@ -43,9 +43,13 @@
 
 ### 1. 构建
 
-需要 Rust 稳定版 toolchain（edition 2024，建议最新 stable）。
+需要 Rust 稳定版 toolchain（edition 2024，建议最新 stable）以及 Node.js（pnpm，用于管理台前端）。
 
 ```bash
+# 1) 构建 Vue 管理台（输出到 html/，编译时内嵌进二进制）
+cd zorv-ui && pnpm install && pnpm build && cd ..
+
+# 2) 构建 Rust 二进制（build.rs 编译时内嵌 html/）
 cargo build --release
 # 产物：
 #   target/release/zorvd  服务端
@@ -232,7 +236,7 @@ powershell -ExecutionPolicy Bypass -File deploy\zorvd-windows-service.ps1
 ## 安全说明
 
 - 握手认证：HMAC-SHA256 + 毫秒时间戳 ±30s 窗口，防重放；可选 `allowed_ips` IP 白名单
-- 管理台：图形验证码、单 IP 防爆破锁定、`SameSite=Lax` Cookie、`data-*` 属性 + 事件委托防 XSS、审计日志、密码 PBKDF2-HMAC-SHA256 存储、可选 HTTPS
+- 管理台：图形验证码、单 IP 防爆破锁定、Bearer Token 会话（`Authorization` header，24h TTL）、XSS 安全渲染、审计日志、密码 PBKDF2-HMAC-SHA256 存储、可选 HTTPS
 - 部署建议：服务端最小化开放端口；隧道端口建议防火墙仅放行客户端 IP；token 定期轮换；管理台默认只监听本机，远程访问请走反向代理或 SSH 转发
 - 合规声明：请仅用于自有服务器、家庭实验室、授权测试环境；在企业/未经授权的网络部署反向隧道可能违反安全政策与法规
 
@@ -255,7 +259,8 @@ src/
 ├── client/             # 客户端：拨号重连、流量转发、UDP 会话
 ├── protocol/           # 帧编解码、握手、fuzz 工具
 └── common/             # 配置、TLS、日志、错误
-html/                   # 管理台页面（include_str! 内嵌，改动需重新编译）
+html/                   # 构建产物：Vue 管理台 SPA（build.rs 内嵌；`cd zorv-ui && pnpm build` 重新生成）
+zorv-ui/                # 管理台源码：Vue 3 + TypeScript + Vite + Tailwind + Pinia + vue-router + axios
 config/                 # 服务端/客户端示例配置
 deploy/                 # systemd 单元、Dockerfile、Windows 服务脚本、部署说明
 examples/               # gen_cert / smoke / fuzz_protocol

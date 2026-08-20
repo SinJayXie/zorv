@@ -1,0 +1,13 @@
+// Global custom styles (SCSS)
+// The bulk of the styling uses Tailwind utility classes; only a few global
+// base styles live here.
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}

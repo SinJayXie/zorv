@@ -30,9 +30,9 @@
 - **TCP / UDP proxying** — port forwarding and UDP datagrams (e.g. DNS forwarding) out of the box.
 - **Traffic obfuscation** — random padding flattens packet-length distribution; random heartbeat jitter (`[obfuscation]`).
 - **Multi-client routing** — `client_id`-based routing; each proxy rule binds to a specific client.
-- **Web admin console** — online clients / overview / settings / traffic monitoring, mobile-responsive:
+- **Web admin console** — Vue 3 SPA (TypeScript + Vite + Tailwind + Pinia + vue-router + axios), online clients / overview / settings / traffic monitoring, mobile-responsive; auth via `Authorization: Bearer <token>` header:
   - Captcha + brute-force protection (5 failed password attempts per IP → 30 min lockout)
-  - Token management (random generation / copy), visual proxy-rule CRUD (modal form + input validation)
+  - Token management (random generation / copy), visual proxy-rule CRUD (modal form + input validation), and password change (old-password verification, forces re-login)
   - Online client list with one-click **kick** (client exits immediately)
   - Traffic monitoring per `client_id` with TCP/UDP up/down stats, **persisted to disk** + 30s-sampled time-series curve (hand-drawn Canvas, ~100 minutes)
   - Hot config reload — edit `zorvd.toml` and it takes effect without a restart (token & proxy-rule diffs applied)
@@ -45,9 +45,13 @@
 
 ### 1. Build
 
-Requires a stable Rust toolchain (edition 2024; latest stable recommended).
+Requires a stable Rust toolchain (edition 2024; latest stable recommended) and Node.js (pnpm) for the admin console.
 
 ```bash
+# 1) Build the Vue admin console (outputs to html/, which is embedded into the binaries)
+cd zorv-ui && pnpm install && pnpm build && cd ..
+
+# 2) Build the Rust binaries (build.rs embeds html/ at compile time)
 cargo build --release
 # Artifacts:
 #   target/release/zorvd   server daemon
@@ -234,7 +238,7 @@ powershell -ExecutionPolicy Bypass -File deploy\zorvd-windows-service.ps1
 ## 🔒 Security Notes
 
 - **Handshake auth** — HMAC-SHA256 + millisecond timestamp within a ±30s window, replay-resistant; optional `allowed_ips` allowlist.
-- **Admin console** — captcha, per-IP brute-force lockout, `SameSite=Lax` cookies, `data-*` attributes + event delegation against XSS, audit logging, PBKDF2-HMAC-SHA256 password storage, optional HTTPS.
+- **Admin console** — captcha, per-IP brute-force lockout, bearer-token sessions (`Authorization` header, 24h TTL), XSS-safe rendering, audit logging, PBKDF2-HMAC-SHA256 password storage, optional HTTPS.
 - **Deployment advice** — expose only the ports you need; firewalling the tunnel port to client IPs is recommended; rotate tokens regularly; the admin console listens on loopback by default — for remote access use a reverse proxy or SSH forwarding.
 - **Compliance** — use it only on your own servers, home labs, and authorized test environments. Deploying reverse tunnels on enterprise or unauthorized networks may violate security policies and regulations.
 
@@ -257,7 +261,8 @@ src/
 ├── client/             # client: dial & reconnect, traffic forwarding, UDP sessions
 ├── protocol/           # frame codec, handshake, fuzzing tools
 └── common/             # config, TLS, logging, errors
-html/                   # admin console pages (embedded via include_str!; rebuild after changes)
+html/                   # built Vue SPA admin console (embedded via build.rs; regenerate with `cd zorv-ui && pnpm build`)
+zorv-ui/                # admin console source: Vue 3 + TypeScript + Vite + Tailwind + Pinia + vue-router + axios
 config/                 # example configs for server & client
 deploy/                 # systemd unit, Dockerfile, Windows service script, deployment docs
 examples/               # gen_cert / smoke / fuzz_protocol
