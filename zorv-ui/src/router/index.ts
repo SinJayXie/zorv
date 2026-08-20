@@ -1,9 +1,9 @@
 // Vue Router: SPA routes + login guard
-import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHashHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 
 const router = createRouter({
-  history: createWebHistory(),
+  history: createWebHashHistory(),
   routes: [
     { path: '/login', name: 'login', component: () => import('@/views/LoginView.vue'), meta: { public: true } },
     {
@@ -14,6 +14,7 @@ const router = createRouter({
         { path: 'clients', name: 'clients', component: () => import('@/views/ClientsView.vue') },
         { path: 'settings', name: 'settings', component: () => import('@/views/SettingsView.vue') },
         { path: 'traffic', name: 'traffic', component: () => import('@/views/TrafficView.vue') },
+        { path: 'audit', name: 'audit', component: () => import('@/views/AuditView.vue') },
       ],
     },
     { path: '/:pathMatch(.*)*', redirect: '/' },

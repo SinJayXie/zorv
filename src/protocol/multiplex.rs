@@ -79,27 +79,47 @@ impl StreamIdAllocator {
     }
 }
 
-/// Build a `STREAM_OPEN` frame (payload is `[target_len:u16][target:bytes]`).
-pub fn build_stream_open(stream_id: u32, target: &str) -> Frame {
-    let mut payload = Vec::with_capacity(2 + target.len());
+/// Build a `STREAM_OPEN` frame.
+///
+/// Payload layout: `[target_len:u16][target:bytes][peer_len:u16][peer:bytes]`.
+/// `peer` is the address of the public-side caller (may be empty for legacy peers).
+pub fn build_stream_open(stream_id: u32, target: &str, peer: &str) -> Frame {
+    let mut payload = Vec::with_capacity(2 + target.len() + 2 + peer.len());
     payload.put_u16_le(target.len() as u16);
     payload.put_slice(target.as_bytes());
+    payload.put_u16_le(peer.len() as u16);
+    payload.put_slice(peer.as_bytes());
     Frame::new(FrameType::StreamOpen, stream_id, payload)
 }
 
-/// Parse a `STREAM_OPEN` payload and return the target address string.
-pub fn parse_stream_open_payload(payload: &[u8]) -> Result<String> {
+/// Parse a `STREAM_OPEN` payload and return `(target, peer)`.
+///
+/// The peer field is optional: frames from legacy servers (target only) yield an
+/// empty peer string.
+pub fn parse_stream_open_payload(payload: &[u8]) -> Result<(String, String)> {
     let mut cur = Cursor::new(payload);
     if cur.remaining() < 2 {
         return Err(ZorvError::Protocol(ProtocolError::Incomplete));
     }
-    let len = cur.get_u16_le() as usize;
-    if cur.remaining() < len {
+    let target_len = cur.get_u16_le() as usize;
+    if cur.remaining() < target_len {
         return Err(ZorvError::Protocol(ProtocolError::Incomplete));
     }
-    let mut buf = vec![0u8; len];
-    cur.copy_to_slice(&mut buf);
-    String::from_utf8(buf).map_err(|e| ZorvError::Other(format!("invalid utf8 in target: {}", e)))
+    let mut target_buf = vec![0u8; target_len];
+    cur.copy_to_slice(&mut target_buf);
+    let target = String::from_utf8(target_buf)
+        .map_err(|e| ZorvError::Other(format!("invalid utf8 in target: {}", e)))?;
+
+    let mut peer = String::new();
+    if cur.remaining() >= 2 {
+        let peer_len = cur.get_u16_le() as usize;
+        if cur.remaining() >= peer_len {
+            let mut peer_buf = vec![0u8; peer_len];
+            cur.copy_to_slice(&mut peer_buf);
+            peer = String::from_utf8_lossy(&peer_buf).into_owned();
+        }
+    }
+    Ok((target, peer))
 }
 
 /// Build a `STREAM_OPEN_ACK` frame (payload is `[status:u8][stream_id:u32_le]`).
@@ -235,11 +255,23 @@ mod tests {
 
     #[test]
     fn stream_open_roundtrip() {
-        let frame = build_stream_open(42, "127.0.0.1:8080");
+        let frame = build_stream_open(42, "127.0.0.1:8080", "203.0.113.7:54321");
         assert_eq!(frame.frame_type, FrameType::StreamOpen);
         assert_eq!(frame.stream_id, 42);
-        let target = parse_stream_open_payload(&frame.payload).unwrap();
+        let (target, peer) = parse_stream_open_payload(&frame.payload).unwrap();
         assert_eq!(target, "127.0.0.1:8080");
+        assert_eq!(peer, "203.0.113.7:54321");
+    }
+
+    #[test]
+    fn stream_open_roundtrip_empty_peer() {
+        // Legacy frame without the peer field: peer must parse as empty
+        let mut payload = Vec::new();
+        payload.put_u16_le("127.0.0.1:8080".len() as u16);
+        payload.put_slice(b"127.0.0.1:8080");
+        let (target, peer) = parse_stream_open_payload(&payload).unwrap();
+        assert_eq!(target, "127.0.0.1:8080");
+        assert_eq!(peer, "");
     }
 
     #[test]

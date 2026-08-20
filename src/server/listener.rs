@@ -17,6 +17,7 @@ use tracing::{info, warn};
 use crate::common::config::ProxyConfig;
 use crate::common::error::{Result, ZorvError};
 use crate::protocol::{build_stream_close, build_stream_data, build_stream_open, Frame};
+use crate::server::audit::AuditLog;
 use crate::server::manager::{TunnelManager, TunnelSession};
 
 /// Timeout for waiting on STREAM_OPEN_ACK (seconds).
@@ -34,6 +35,7 @@ pub async fn run_proxy_listener(
     listener: TcpListener,
     proxy: ProxyConfig,
     manager: Arc<TunnelManager>,
+    audit: Arc<AuditLog>,
 ) {
     let listen = listener
         .local_addr()
@@ -53,11 +55,21 @@ pub async fn run_proxy_listener(
             "new public connection: name={} peer={}",
             proxy.name, peer
         );
+        // Connection audit: which public IP reached which proxy service
+        audit.record(
+            &peer.to_string(),
+            "proxy_connect",
+            &format!(
+                "proxy={} target={} peer={}",
+                proxy.name, proxy.target, peer
+            ),
+        );
 
         let manager = Arc::clone(&manager);
         let proxy = proxy.clone();
+        let peer_str = peer.to_string();
         tokio::spawn(async move {
-            if let Err(e) = handle_public_conn(conn, proxy, manager).await {
+            if let Err(e) = handle_public_conn(conn, proxy, manager, peer_str).await {
                 warn!("public conn handler error: {}", e);
             }
         });
@@ -69,6 +81,7 @@ async fn handle_public_conn(
     conn: TcpStream,
     proxy: ProxyConfig,
     manager: Arc<TunnelManager>,
+    peer: String,
 ) -> Result<()> {
     let client_id = proxy.client_id.as_ref().ok_or_else(|| {
         ZorvError::Other(format!("proxy {} missing client_id", proxy.name))
@@ -88,8 +101,8 @@ async fn handle_public_conn(
     let (ack_tx, ack_rx) = oneshot::channel::<bool>();
     session.pending_opens.insert(stream_id, ack_tx);
 
-    // Send STREAM_OPEN
-    let open_frame = build_stream_open(stream_id, &proxy.target);
+    // Send STREAM_OPEN (carries the external caller's address so the client can log it)
+    let open_frame = build_stream_open(stream_id, &proxy.target, &peer);
     if let Err(_) = session.frame_tx.send(open_frame).await {
         // Tunnel closed
         session.pending_opens.remove(&stream_id);

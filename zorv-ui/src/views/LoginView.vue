@@ -12,16 +12,42 @@ const password = ref('')
 const captcha = ref('')
 const msg = ref('')
 const loading = ref(false)
+// Field-level validation state: red border when a required field is empty
+const fieldErr = ref({ username: false, password: false, captcha: false })
 
 const captchaUrl = ref('')
 function refreshCaptcha() {
   captchaUrl.value = `/api/captcha?t=${Date.now()}`
   captcha.value = ''
+  fieldErr.value.captcha = false
 }
 refreshCaptcha()
 
+// All inputs must be filled before submitting
+function validate(): boolean {
+  fieldErr.value = {
+    username: !username.value.trim(),
+    password: !password.value,
+    captcha: !captcha.value.trim(),
+  }
+  if (fieldErr.value.username) {
+    msg.value = 'Username is required'
+    return false
+  }
+  if (fieldErr.value.password) {
+    msg.value = 'Password is required'
+    return false
+  }
+  if (fieldErr.value.captcha) {
+    msg.value = 'Captcha code is required'
+    return false
+  }
+  return true
+}
+
 async function onSubmit() {
   msg.value = ''
+  if (!validate()) return
   loading.value = true
   try {
     const res = await auth.login(username.value.trim(), password.value, captcha.value.trim())
@@ -58,7 +84,10 @@ async function onSubmit() {
                 type="text"
                 autocomplete="username"
                 placeholder="Username"
-                class="w-full bg-[#F2F2F7] border border-[#E5E5EA] rounded-xl pl-10 pr-3 py-3 text-[15px] placeholder:text-[#8E8E93] focus:outline-none focus:ring-2 focus:ring-[#007AFF] focus:border-[#007AFF] transition"
+                class="w-full bg-[#F2F2F7] border rounded-xl pl-10 pr-3 py-3 text-[15px] placeholder:text-[#8E8E93] focus:outline-none focus:ring-2 transition"
+                :class="fieldErr.username
+                  ? 'border-red-400 focus:ring-red-200 focus:border-red-400'
+                  : 'border-[#E5E5EA] focus:ring-[#007AFF] focus:border-[#007AFF]'"
               />
             </div>
           </div>
@@ -75,7 +104,10 @@ async function onSubmit() {
                 type="password"
                 autocomplete="current-password"
                 placeholder="Password"
-                class="w-full bg-[#F2F2F7] border border-[#E5E5EA] rounded-xl pl-10 pr-3 py-3 text-[15px] placeholder:text-[#8E8E93] focus:outline-none focus:ring-2 focus:ring-[#007AFF] focus:border-[#007AFF] transition"
+                class="w-full bg-[#F2F2F7] border rounded-xl pl-10 pr-3 py-3 text-[15px] placeholder:text-[#8E8E93] focus:outline-none focus:ring-2 transition"
+                :class="fieldErr.password
+                  ? 'border-red-400 focus:ring-red-200 focus:border-red-400'
+                  : 'border-[#E5E5EA] focus:ring-[#007AFF] focus:border-[#007AFF]'"
               />
             </div>
           </div>
@@ -94,7 +126,10 @@ async function onSubmit() {
                   maxlength="4"
                   autocomplete="off"
                   placeholder="Captcha Code"
-                  class="w-full uppercase bg-[#F2F2F7] border border-[#E5E5EA] rounded-xl pl-10 pr-3 py-3 text-[15px] placeholder:text-[#8E8E93] focus:outline-none focus:ring-2 focus:ring-[#007AFF] focus:border-[#007AFF] transition"
+                  class="w-full uppercase bg-[#F2F2F7] border rounded-xl pl-10 pr-3 py-3 text-[15px] placeholder:text-[#8E8E93] focus:outline-none focus:ring-2 transition"
+                  :class="fieldErr.captcha
+                    ? 'border-red-400 focus:ring-red-200 focus:border-red-400'
+                    : 'border-[#E5E5EA] focus:ring-[#007AFF] focus:border-[#007AFF]'"
                 />
               </div>
               <img

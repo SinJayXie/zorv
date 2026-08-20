@@ -13,6 +13,7 @@ use tracing::info;
 
 use crate::common::config::ProxyConfig;
 use crate::common::error::{Result, ZorvError};
+use crate::server::audit::AuditLog;
 use crate::server::listener::run_proxy_listener;
 use crate::server::manager::TunnelManager;
 use crate::server::udp::run_udp_proxy_listener;
@@ -21,13 +22,16 @@ use crate::server::udp::run_udp_proxy_listener;
 pub struct ProxyManager {
     tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     manager: Arc<TunnelManager>,
+    /// Shared audit log (records proxy connection events).
+    audit: Arc<AuditLog>,
 }
 
 impl ProxyManager {
-    pub fn new(manager: Arc<TunnelManager>) -> Self {
+    pub fn new(manager: Arc<TunnelManager>, audit: Arc<AuditLog>) -> Self {
         Self {
             tasks: Mutex::new(HashMap::new()),
             manager,
+            audit,
         }
     }
 
@@ -51,8 +55,9 @@ impl ProxyManager {
                 let listener = TcpListener::bind(listen).await?;
                 let p = proxy.clone();
                 let mgr = Arc::clone(&self.manager);
+                let audit = Arc::clone(&self.audit);
                 tokio::spawn(async move {
-                    run_proxy_listener(listener, p, mgr).await;
+                    run_proxy_listener(listener, p, mgr, audit).await;
                 })
             }
             "udp" => {

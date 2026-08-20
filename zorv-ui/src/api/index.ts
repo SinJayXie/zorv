@@ -35,8 +35,8 @@ http.interceptors.response.use(
   (err) => {
     if (err.response?.status === 401) {
       clearToken()
-      if (!window.location.pathname.startsWith('/login')) {
-        window.location.replace('/login')
+      if (!window.location.pathname.startsWith('/')) {
+        window.location.replace('/')
       }
     }
     return Promise.reject(err)

@@ -26,6 +26,7 @@ use crate::common::config::{save_server, AdminTlsConfig, ProxyConfig, ServerConf
 use crate::common::crypto::now_millis;
 use crate::common::error::Result;
 use crate::common::tls::build_server_acceptor;
+use crate::server::audit::{AuditEntry, AuditLog};
 use crate::server::manager::TunnelManager;
 use crate::server::proxy::ProxyManager;
 use crate::server::traffic::{TrafficCounter, TrafficTracker};
@@ -70,6 +71,8 @@ pub struct AdminState {
     pub blocked_ips: DashMap<String, u64>,
     /// Captchas: `captcha_id -> (answer, expiry ms)`, single use.
     pub captchas: DashMap<String, (String, u64)>,
+    /// Shared audit log (in-memory ring buffer + on-disk JSONL).
+    pub audit_logs: Arc<AuditLog>,
     /// Traffic statistics tracker (cumulative counters + persistence).
     pub traffic: Arc<TrafficTracker>,
 }
@@ -268,10 +271,10 @@ fn json_err_response(status: &'static str, msg: &str) -> Response {
 
 fn redirect_response(location: &str) -> Response {
     Response {
-        status: "302 Found",
+        status: "404 Not Found",
         content_type: "text/html; charset=utf-8",
-        extra_headers: format!("Location: {}\r\n", location),
-        body: Vec::new(),
+        extra_headers: String::new(),
+        body: format!("404 Not Found: {}", location).into_bytes(),
     }
 }
 
@@ -374,8 +377,15 @@ async fn route(req: &HttpRequest, state: &AdminState) -> Response {
         return api_metrics(state).await;
     }
     // The login page is part of the SPA; serve the app shell (the router renders /login client-side)
-    if method == "GET" && (path == "/login.html" || path == "/login") {
+    if method == "GET" && (path == "/" || path == "/index.html" || path == "/login" || path == "/login.html") {
         if let Some(resp) = serve_static("index.html") {
+            return resp;
+        }
+    }
+    // Static assets are public (they contain no data; auth is enforced on the APIs).
+    // The browser fetches them without any token, so they must not be gated.
+    if method == "GET" && (path.starts_with("/assets/") || path == "/favicon.ico" || path == "/favicon.svg") {
+        if let Some(resp) = serve_static(path) {
             return resp;
         }
     }
@@ -386,7 +396,7 @@ async fn route(req: &HttpRequest, state: &AdminState) -> Response {
     // Auth (skipped when the password is empty)
     if !is_authenticated(state, req).await {
         if method == "GET" && !path.starts_with("/api/") {
-            return redirect_response("/login");
+            return redirect_response("/");
         }
         return json_err_response("401 Unauthorized", "unauthorized");
     }
@@ -421,13 +431,14 @@ async fn route(req: &HttpRequest, state: &AdminState) -> Response {
         ("GET", "/api/clients") => api_clients(state).await,
         ("GET", "/api/traffic") => api_traffic(state).await,
         ("GET", "/api/traffic/history") => api_traffic_history(state).await,
+        ("GET", "/api/audit") => api_audit(query, state).await,
         ("GET", "/api/proxies") => api_proxies(state).await,
         ("POST", "/api/proxies") => api_create_proxy(req, state).await,
         ("PUT", "/api/token") => api_update_token(req, state).await,
         ("POST", "/api/password") => api_change_password(req, state).await,
         ("POST", "/api/kick") => api_kick(req, state).await,
-        ("POST", "/api/reload") => api_reload(state).await,
-        ("DELETE", "/api/proxies") => api_delete_proxy(query, state).await,
+        ("POST", "/api/reload") => api_reload(req, state).await,
+        ("DELETE", "/api/proxies") => api_delete_proxy(req, query, state).await,
         _ => json_err_response("404 Not Found", "not found"),
     }
 }
@@ -540,9 +551,11 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Audit log: records key admin operations (login, token/rule changes, kicks, etc.).
-fn audit(action: &str, detail: &str) {
-    tracing::info!(target: "audit", "{action} {detail}");
+/// Records an audit event: writes to the audit log (tracing) and appends to the
+/// shared audit log (disk + ring buffer) so it can be browsed from the admin console.
+fn audit(state: &AdminState, ip: &str, action: &str, detail: &str) {
+    tracing::info!(target: "audit", "{action} {detail} ip={ip}");
+    state.audit_logs.record(ip, action, detail);
 }
 
 /// Constant-time string comparison (avoids timing side channels).
@@ -580,12 +593,12 @@ async fn api_login(req: &HttpRequest, state: &AdminState) -> Response {
 
     // Captcha check (single-use, burned after use)
     if !check_captcha(state, req.captcha.as_deref(), &lreq.captcha_code) {
-        return json_err_response("401 Unauthorized", "验证码错误或已过期");
+        return json_err_response("401 Unauthorized", "captcha error or expired");
     }
 
     if lreq.username == state.username && verify_password(&lreq.password, &stored_pwd) {
         // Login succeeded: clear this IP's failure count
-        audit("login", &format!("ok user={} ip={}", lreq.username, req.ip));
+        audit(state, &req.ip, "login", &format!("ok user={}", lreq.username));
         state.login_failures.remove(&req.ip);
         let session = gen_session_token();
         let expire = now_millis() + SESSION_TTL_MS;
@@ -596,9 +609,9 @@ async fn api_login(req: &HttpRequest, state: &AdminState) -> Response {
     }
 
     // Wrong password: accumulate failures, block the IP for 30 minutes at the threshold
-    audit("login", &format!("failed user={} ip={}", lreq.username, req.ip));
+    audit(state, &req.ip, "login", &format!("failed user={}", lreq.username));
     record_login_failure(state, &req.ip);
-    json_err_response("401 Unauthorized", "用户名或密码错误")
+    json_err_response("401 Unauthorized", "username or password error")
 }
 
 /// Verify a captcha: the id must exist, be unexpired, and match the answer
@@ -859,24 +872,24 @@ async fn api_metrics(state: &AdminState) -> Response {
     let _ = writeln!(out, "zorv_online_clients {}", clients.len());
 
     // Number of configured proxy rules
-    let _ = writeln!(out, "# HELP zorv_configured_proxies 已配置的代理规则数");
+    let _ = writeln!(out, "# HELP zorv_configured_proxies Number of configured proxy rules");
     let _ = writeln!(out, "# TYPE zorv_configured_proxies gauge");
     let _ = writeln!(out, "zorv_configured_proxies {}", state.proxies.read().await.len());
 
     // Total number of currently active streams
     let active_streams: usize = clients.iter().map(|c| c.active_streams).sum();
-    let _ = writeln!(out, "# HELP zorv_active_streams 当前活动的业务流总数");
+    let _ = writeln!(out, "# HELP zorv_active_streams Current number of active streams");
     let _ = writeln!(out, "# TYPE zorv_active_streams gauge");
     let _ = writeln!(out, "zorv_active_streams {active_streams}");
 
     // Cumulative traffic per client (including live online deltas)
-    let _ = writeln!(out, "# HELP zorv_traffic_tcp_up_bytes_total 累计 TCP 上行字节数");
+    let _ = writeln!(out, "# HELP zorv_traffic_tcp_up_bytes_total Cumulative TCP up bytes sent");
     let _ = writeln!(out, "# TYPE zorv_traffic_tcp_up_bytes_total counter");
-    let _ = writeln!(out, "# HELP zorv_traffic_tcp_down_bytes_total 累计 TCP 下行字节数");
+    let _ = writeln!(out, "# HELP zorv_traffic_tcp_down_bytes_total Cumulative TCP down bytes received");
     let _ = writeln!(out, "# TYPE zorv_traffic_tcp_down_bytes_total counter");
-    let _ = writeln!(out, "# HELP zorv_traffic_udp_up_bytes_total 累计 UDP 上行字节数");
+    let _ = writeln!(out, "# HELP zorv_traffic_udp_up_bytes_total Cumulative UDP up bytes sent");
     let _ = writeln!(out, "# TYPE zorv_traffic_udp_up_bytes_total counter");
-    let _ = writeln!(out, "# HELP zorv_traffic_udp_down_bytes_total 累计 UDP 下行字节数");
+    let _ = writeln!(out, "# HELP zorv_traffic_udp_down_bytes_total Cumulative UDP down bytes received");
     let _ = writeln!(out, "# TYPE zorv_traffic_udp_down_bytes_total counter");
     let mut keys: Vec<&String> = totals.keys().collect();
     keys.sort();
@@ -935,7 +948,7 @@ async fn api_kick(req: &HttpRequest, state: &AdminState) -> Response {
 
     // Remove the session: after the kick, no new streams are accepted for this client_id (the connection closes itself once the client exits)
     state.manager.unregister(&kreq.client_id);
-    audit("kick", &format!("client_id={}", kreq.client_id));
+    audit(state, &req.ip, "kick", &format!("client_id={}", kreq.client_id));
     info!("kicked client: {}", kreq.client_id);
     json_response("200 OK", json_ok())
 }
@@ -977,6 +990,8 @@ async fn api_create_proxy(req: &HttpRequest, state: &AdminState) -> Response {
     }
 
     audit(
+        state,
+        &req.ip,
         "upsert_proxy",
         &format!(
             "name={} type={} listen={:?} client_id={:?} target={}",
@@ -995,7 +1010,7 @@ async fn api_create_proxy(req: &HttpRequest, state: &AdminState) -> Response {
     json_response("200 OK", json_ok())
 }
 
-async fn api_delete_proxy(query: &str, state: &AdminState) -> Response {
+async fn api_delete_proxy(req: &HttpRequest, query: &str, state: &AdminState) -> Response {
     let name = query
         .split('&')
         .find_map(|kv| {
@@ -1021,7 +1036,7 @@ async fn api_delete_proxy(query: &str, state: &AdminState) -> Response {
         let mut proxies = state.proxies.write().await;
         proxies.retain(|p| p.name != name);
     }
-    audit("delete_proxy", &format!("name={}", name));
+    audit(state, &req.ip, "delete_proxy", &format!("name={}", name));
 
     persist(state).await;
     json_response("200 OK", json_ok())
@@ -1047,7 +1062,7 @@ async fn api_update_token(req: &HttpRequest, state: &AdminState) -> Response {
     };
 
     *state.token.write().await = new_token.clone();
-    audit("update_token", "token rotated");
+    audit(state, &req.ip, "update_token", "token rotated");
 
     persist(state).await;
     // Return the new token for the admin UI to display and copy.
@@ -1085,7 +1100,7 @@ async fn api_change_password(req: &HttpRequest, state: &AdminState) -> Response 
     {
         let cur = state.password.read().await;
         if !cur.is_empty() && !verify_password(&preq.old_password, &cur) {
-            audit("change_password", "failed (old password mismatch)");
+            audit(state, &req.ip, "change_password", "failed (old password mismatch)");
             return json_err_response("400 Bad Request", "旧密码错误");
         }
     }
@@ -1099,7 +1114,7 @@ async fn api_change_password(req: &HttpRequest, state: &AdminState) -> Response 
     // Password changed: invalidate all sessions so everyone must re-login.
     state.sessions.clear();
 
-    audit("change_password", "admin password updated");
+    audit(state, &req.ip, "change_password", "admin password updated");
     info!("admin password changed");
     json_response("200 OK", json_ok())
 }
@@ -1111,11 +1126,57 @@ fn gen_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// `GET /api/audit?page=1&page_size=50`: returns a page of audit entries (newest first).
+async fn api_audit(query: &str, state: &AdminState) -> Response {
+    #[derive(Serialize)]
+    struct AuditPage {
+        total: usize,
+        page: usize,
+        page_size: usize,
+        items: Vec<AuditEntry>,
+    }
+
+    let mut page = 1usize;
+    let mut page_size = 50usize;
+    for kv in query.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            match k {
+                "page" => page = v.parse().unwrap_or(1),
+                "page_size" => page_size = v.parse().unwrap_or(50),
+                _ => {}
+            }
+        }
+    }
+    if page == 0 {
+        page = 1;
+    }
+    page_size = page_size.clamp(1, 200);
+
+    let all = state.audit_logs.snapshot();
+    let total = all.len();
+    let start = (page - 1) * page_size;
+    let items = if start >= total {
+        Vec::new()
+    } else {
+        all[start..total.min(start + page_size)].to_vec()
+    };
+
+    json_response(
+        "200 OK",
+        json_body(&AuditPage {
+            total,
+            page,
+            page_size,
+            items,
+        }),
+    )
+}
+
 /// `POST /api/reload`: reloads the config file from disk, hot-updating the token and proxy rules (no restart).
 ///
 /// Differential application: rules removed are stopped, new/changed rules are started with the new config, and the token is swapped immediately;
 /// the startup snapshot `base` is also updated so subsequent `persist` calls do not lose other on-disk fields.
-async fn api_reload(state: &AdminState) -> Response {
+async fn api_reload(req: &HttpRequest, state: &AdminState) -> Response {
     if state.config_path.is_empty() {
         return json_err_response("400 Bad Request", "config path not set");
     }
@@ -1157,7 +1218,7 @@ async fn api_reload(state: &AdminState) -> Response {
     }
     *state.proxies.write().await = desired;
     *state.base.write().await = cfg;
-    audit("reload", "config reloaded from disk");
+    audit(state, &req.ip, "reload", "config reloaded from disk");
     info!("config reloaded from {}", state.config_path);
     json_response("200 OK", json_ok())
 }
@@ -1218,7 +1279,15 @@ mod tests {
 
     fn make_state_with_password(password: &str) -> Arc<AdminState> {
         let manager = Arc::new(TunnelManager::new());
-        let proxy_manager = Arc::new(ProxyManager::new(Arc::clone(&manager)));
+        // Unique temp dir per state: parallel tests must never share audit.log
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zorv-state-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let audit_log = Arc::new(AuditLog::new(&dir.to_string_lossy()));
+        let proxy_manager = Arc::new(ProxyManager::new(Arc::clone(&manager), Arc::clone(&audit_log)));
         let base = ServerConfig {
             tunnel_addr: "127.0.0.1:8443".to_string(),
             tls: ServerTlsConfig {
@@ -1250,6 +1319,7 @@ mod tests {
             login_failures: DashMap::new(),
             blocked_ips: DashMap::new(),
             captchas: DashMap::new(),
+            audit_logs: audit_log,
             traffic: Arc::new(TrafficTracker::load(&std::env::temp_dir().to_string_lossy())),
         })
     }
@@ -1359,6 +1429,42 @@ mod tests {
         assert_eq!(v["clients"], 0);
         assert_eq!(v["proxies"], 0);
         assert_eq!(v["token"], "init-token");
+    }
+
+    #[tokio::test]
+    async fn api_audit_paginates_newest_first() {
+        let state = make_state();
+        for i in 0..5 {
+            state.audit_logs.record(
+                &format!("10.0.0.{i}"),
+                "proxy_connect",
+                &format!("proxy=web target=127.0.0.1:80 peer=10.0.0.{i}"),
+            );
+        }
+
+        // Page 1 (newest first), page_size=2
+        let resp = route(&req("GET", "/api/audit?page=1&page_size=2", vec![]), &state).await;
+        assert_eq!(resp.status, "200 OK", "body={}", String::from_utf8_lossy(&resp.body));
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["total"], 5);
+        assert_eq!(v["page"], 1);
+        assert_eq!(v["page_size"], 2);
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["ip"], "10.0.0.4", "newest first");
+        assert_eq!(items[1]["ip"], "10.0.0.3");
+
+        // Last page holds the remainder
+        let resp = route(&req("GET", "/api/audit?page=3&page_size=2", vec![]), &state).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["ip"], "10.0.0.0");
+
+        // Out-of-range page → empty items
+        let resp = route(&req("GET", "/api/audit?page=99&page_size=2", vec![]), &state).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert!(v["items"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1504,11 +1610,11 @@ mod tests {
 
     #[test]
     fn error_frame_roundtrip() {
-        let frame = crate::protocol::build_error_frame("已被管理员踢出");
+        let frame = crate::protocol::build_error_frame("Kicked by admin");
         assert_eq!(frame.frame_type, crate::protocol::FrameType::Error);
         assert_eq!(
             crate::protocol::parse_error_payload(&frame.payload).unwrap(),
-            "已被管理员踢出"
+            "Kicked by admin"
         );
     }
 
@@ -1659,13 +1765,13 @@ mod tests {
         let resp = route(&pwd_req(&session, body), &state).await;
         assert_eq!(resp.status, "200 OK", "body={}", String::from_utf8_lossy(&resp.body));
         let pwd = state.password.read().await.clone();
-        assert!(!verify_password("secret", &pwd), "旧密码必须失效");
-        assert!(verify_password("newpass123", &pwd), "新密码必须可用");
+        assert!(!verify_password("secret", &pwd), "old password must be invalid");
+        assert!(verify_password("newpass123", &pwd), "new password must be valid");
         assert!(pwd.starts_with("$pbkdf2-sha256$"));
-        assert!(state.sessions.is_empty(), "所有会话必须失效");
+        assert!(state.sessions.is_empty(), "all sessions must be invalid");
         assert!(
             state.base.read().await.admin.password == pwd,
-            "base 快照必须同步，以便持久化"
+            "base snapshot must be updated"
         );
     }
 
@@ -1681,6 +1787,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn static_assets_require_no_auth() {
+        let state = make_state_with_password("secret");
+        // The SPA shell must be fetchable without any token
+        let resp = route(&req("GET", "/login", vec![]), &state).await;
+        assert_eq!(resp.status, "200 OK");
+
+        // Every embedded asset under /assets/ must be served without auth,
+        // otherwise the browser cannot load JS/CSS before login.
+        let asset_keys: Vec<String> = static_files()
+            .keys()
+            .filter(|k| k.starts_with("assets/"))
+            .map(|k| k.to_string())
+            .collect();
+        for key in asset_keys {
+            let resp = route(&req("GET", &format!("/{key}"), vec![]), &state).await;
+            assert_eq!(resp.status, "200 OK", "asset /{key} must be public");
+        }
+    }
+
+    #[tokio::test]
     async fn auth_required_when_password_set() {
         let state = make_state_with_password("secret");
 
@@ -1688,13 +1814,12 @@ mod tests {
         let resp = route(&req("GET", "/api/status", vec![]), &state).await;
         assert_eq!(resp.status, "401 Unauthorized");
 
-        // Visiting a page without login → redirect to the login route
         let resp = route(&req("GET", "/", vec![]), &state).await;
-        assert_eq!(resp.status, "302 Found");
-        assert!(resp.extra_headers.contains("Location: /login"));
+        assert_eq!(resp.status, "200 OK");
+        assert!(String::from_utf8_lossy(&resp.body).len() > 0);
 
         // The login page itself requires no auth
-        let resp = route(&req("GET", "/login.html", vec![]), &state).await;
+        let resp = route(&req("GET", "/index.html", vec![]), &state).await;
         assert_eq!(resp.status, "200 OK");
         // The SPA shell (index.html) is served even when embedded assets exist
         assert!(String::from_utf8_lossy(&resp.body).len() > 0);
@@ -1743,7 +1868,7 @@ mod tests {
         let body = br#"{"username":"admin","password":"secret","captcha_code":""}"#.to_vec();
         let resp = route(&login_req(body, None), &state).await;
         assert_eq!(resp.status, "401 Unauthorized");
-        assert!(String::from_utf8_lossy(&resp.body).contains("验证码"));
+        assert!(String::from_utf8_lossy(&resp.body).contains("captcha"));
 
         // Wrong captcha → rejected and consumed (single use)
         let cid = add_captcha(&state);
@@ -1797,8 +1922,8 @@ mod tests {
         state
             .blocked_ips
             .insert("1.2.3.4".to_string(), now_millis() - 1);
-        assert!(!is_ip_blocked(&state, "1.2.3.4"), "过期封禁应解除");
-        assert!(state.blocked_ips.get("1.2.3.4").is_none(), "过期封禁应被清理");
+        assert!(!is_ip_blocked(&state, "1.2.3.4"), "expired ban should be cleared");
+        assert!(state.blocked_ips.get("1.2.3.4").is_none(), "expired ban should be cleared");
     }
 
     #[tokio::test]

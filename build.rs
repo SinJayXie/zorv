@@ -1,21 +1,32 @@
-//! Build script: walks the `html/` directory and generates a Rust source file
+//! Build script: builds the Vue admin console (`pnpm build` in `zorv-ui/`),
+//! then walks the resulting `html/` directory and generates a Rust source file
 //! that embeds every static asset (index.html + built JS/CSS/etc.) via
 //! `include_bytes!`. The generated file is consumed by `src/server/admin.rs`
 //! through `include!(concat!(env!("OUT_DIR"), "/embedded_html.rs"))`.
 //!
-//! The `html/` directory is the output target of the Vue frontend build
-//! (`zorv-ui`), so this keeps the web console fully self-contained in the
-//! binary with no runtime file access.
+//! Re-runs whenever the frontend sources change, so `cargo build` always
+//! embeds an up-to-date admin console with no manual step required.
 
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR missing");
-    let html_dir = Path::new(&manifest_dir).join("html");
-    println!("cargo:rerun-if-changed=html");
+    let ui_dir = Path::new(&manifest_dir).join("zorv-ui");
 
+    // Re-run this script when the frontend sources change
+    println!("cargo:rerun-if-changed=zorv-ui/src");
+    println!("cargo:rerun-if-changed=zorv-ui/index.html");
+    println!("cargo:rerun-if-changed=zorv-ui/vite.config.ts");
+    println!("cargo:rerun-if-changed=zorv-ui/package.json");
+    println!("cargo:rerun-if-changed=zorv-ui/pnpm-lock.yaml");
+
+    // Build the Vue admin console (outputs into html/) before embedding it
+    build_ui(&ui_dir);
+
+    let html_dir = Path::new(&manifest_dir).join("html");
     let mut files: Vec<(String, String)> = Vec::new();
     if html_dir.is_dir() {
         collect_files(&html_dir, "", &mut files);
@@ -38,6 +49,73 @@ fn main() {
     );
     fs::write(Path::new(&out_dir).join("embedded_html.rs"), generated)
         .expect("failed to write embedded_html.rs");
+}
+
+/// Runs `pnpm build` in the zorv-ui directory.
+///
+/// A failure is only a warning: the build continues with whatever is already
+/// in `html/` (empty on a fresh checkout, in which case the admin console
+/// serves 404s for page routes but the tunnel itself keeps working).
+///
+/// The build is skipped entirely when:
+/// - `ZORV_SKIP_UI_BUILD=1` is set, or
+/// - running under WSL where `/mnt/...` is a Windows mount (DrvFS): running
+///   pnpm/vite there does massive cross-filesystem I/O and appears to hang.
+fn build_ui(ui_dir: &Path) {
+    if !ui_dir.join("package.json").exists() {
+        eprintln!("warning: zorv-ui missing, skipping admin console build");
+        return;
+    }
+
+    if env::var_os("ZORV_SKIP_UI_BUILD").is_some() {
+        println!("cargo:warning=ZORV_SKIP_UI_BUILD set, skipping admin console build");
+        return;
+    }
+
+    if is_wsl() {
+        println!(
+            "cargo:warning=WSL detected, skipping admin console build \
+             (embedding existing html/ output; rebuild the frontend on the host first)"
+        );
+        return;
+    }
+
+    let status = {
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "pnpm", "build"]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = Command::new("pnpm");
+            c.arg("build");
+            c
+        };
+        cmd.current_dir(ui_dir).status()
+    };
+
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!(
+            "warning: `pnpm build` exited with {:?}; using existing html/ output if present",
+            s.code()
+        ),
+        Err(e) => eprintln!(
+            "warning: failed to run `pnpm build` ({e}); using existing html/ output if present"
+        ),
+    }
+}
+
+/// Detects WSL by checking the environment / kernel version.
+fn is_wsl() -> bool {
+    if env::var_os("WSL_DISTRO_NAME").is_some() {
+        return true;
+    }
+    std::fs::read_to_string("/proc/version")
+        .map(|v| v.to_lowercase().contains("microsoft"))
+        .unwrap_or(false)
 }
 
 fn collect_files(dir: &Path, prefix: &str, out: &mut Vec<(String, String)>) {

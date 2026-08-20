@@ -50,6 +50,22 @@ export interface ProxyRule {
   target: string
 }
 
+/** A single audit entry from GET /api/audit */
+export interface AuditEntry {
+  ts_ms: number
+  action: string
+  detail: string
+  ip: string
+}
+
+/** Paged audit response */
+export interface AuditPage {
+  total: number
+  page: number
+  page_size: number
+  items: AuditEntry[]
+}
+
 /** Common success response { ok: true, ... } */
 export interface ApiOk {
   ok: boolean

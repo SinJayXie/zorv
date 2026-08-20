@@ -5,6 +5,7 @@
 //! spawn a public-port listener for each TCP proxy → wait for ctrl_c for graceful shutdown.
 
 pub mod admin;
+pub mod audit;
 pub mod auth;
 pub mod listener;
 pub mod manager;
@@ -24,6 +25,7 @@ use tracing::{error, info, warn};
 use crate::common::config::ServerConfig;
 use crate::common::tls::build_server_acceptor;
 use crate::server::admin::{run_admin_server, AdminState};
+use crate::server::audit::AuditLog;
 use crate::server::manager::TunnelManager;
 use crate::server::proxy::ProxyManager;
 use crate::server::traffic::{TrafficTracker, SAMPLE_INTERVAL};
@@ -147,7 +149,8 @@ impl Server {
         });
 
         // 5. Start a public-port listener for each proxy rule (tcp/udp), managed dynamically by ProxyManager
-        let proxy_manager = Arc::new(ProxyManager::new(Arc::clone(&manager)));
+        let audit_log = Arc::new(AuditLog::new(&self.config.data_dir));
+        let proxy_manager = Arc::new(ProxyManager::new(Arc::clone(&manager), Arc::clone(&audit_log)));
         for proxy in self.config.proxies.iter() {
             if let Err(e) = proxy_manager.start(proxy.clone()).await {
                 error!("start proxy {} failed: {}", proxy.name, e);
@@ -165,6 +168,7 @@ impl Server {
                 base: RwLock::new(self.config.clone()),
                 username: self.config.admin.username.clone(),
                 password: Arc::new(RwLock::new(self.config.admin.password.clone())),
+                audit_logs: Arc::clone(&audit_log),
                 traffic: Arc::clone(&traffic),
                 sessions: dashmap::DashMap::new(),
                 login_failures: dashmap::DashMap::new(),

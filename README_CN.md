@@ -34,7 +34,7 @@
   - 在线客户端列表 + 一键踢出（踢出后客户端退出）
   - 流量监控：按 `client_id` 的 TCP/UDP 上行/下行统计，**落盘持久化** + 30s 采样时序曲线（Canvas 手绘，近 100 分钟）
   - 配置热重载：编辑服务端 `zorvd.toml` 后免重启生效（token 与代理规则差异应用）
-  - 审计日志：登录、token 修改、规则增删改、重载、踢出均记录
+  - 审计日志：登录、token 修改、规则增删改、重载、踢出、穿透连接（哪个公网 IP 访问了哪个服务）均记录，持久化到 `data/audit.log`，管理台提供分页的审计页浏览
   - 管理台可选用 HTTPS（`[admin.tls]`），密码支持 PBKDF2-HMAC-SHA256 哈希存储
 - **可观测性**：Prometheus `/metrics`（在线客户端/配置规则/活跃流/TCP·UDP 流量计数，免鉴权供抓取）、客户端掉线 Webhook 通知
 - **健壮性**：断线指数退避自动重连、心跳超时清理、重连竞态防护（旧会话清理不会误删新会话）
@@ -231,6 +231,8 @@ powershell -ExecutionPolicy Bypass -File deploy\zorvd-windows-service.ps1
   - `zorv_online_clients`、`zorv_configured_proxies`、`zorv_active_streams`（gauge）
   - `zorv_traffic_{tcp,udp}_{up,down}_bytes_total{client_id="..."}`（counter）
 - **流量历史 API**：`GET /api/traffic/history` 返回 30s 采样的时序历史（近 100 分钟，内存环形缓冲），管理台曲线图即用此数据
+- **审计 API**：`GET /api/audit?page=1&page_size=50` 分页返回审计记录（新在前）：`{total, page, page_size, items}`，供管理台审计页使用
+- **客户端连接日志**：每次隧道建立新穿透流时，客户端控制台打印 `new tunnel connection: peer=<对方IP> service=<目标服务>`
 - **掉线 Webhook**：`[notify] webhook` 配置后，客户端会话结束时 POST JSON `{"event":"offline","client_id":"..."}`
 
 ## 安全说明

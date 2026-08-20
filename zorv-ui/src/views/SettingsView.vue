@@ -1,5 +1,6 @@
 <script setup lang="ts">
-// Settings page: Token management / Change password / Config hot reload / Proxy rule CRUD
+// Settings page: Token management / Change password (both in modals) /
+// Config hot reload / Proxy rule CRUD
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import http from '@/api'
@@ -7,10 +8,17 @@ import type { ClientInfo, ProxyRule, Status } from '@/types'
 
 const router = useRouter()
 
-// ---------- Token management ----------
+// ---------- Token management (modal) ----------
+const tokenModal = ref(false)
 const curToken = ref('')
 const tokenInput = ref('')
 const tokenMsg = ref<{ text: string; ok: boolean } | null>(null)
+
+function openTokenModal() {
+  tokenInput.value = ''
+  tokenMsg.value = null
+  tokenModal.value = true
+}
 
 async function loadToken() {
   try {
@@ -49,11 +57,20 @@ async function updateToken(generate = false) {
   }
 }
 
-// ---------- Change password ----------
+// ---------- Change password (modal) ----------
+const pwdModal = ref(false)
 const pwdOld = ref('')
 const pwdNew = ref('')
 const pwdConfirm = ref('')
 const pwdMsg = ref<{ text: string; ok: boolean } | null>(null)
+
+function openPwdModal() {
+  pwdOld.value = ''
+  pwdNew.value = ''
+  pwdConfirm.value = ''
+  pwdMsg.value = null
+  pwdModal.value = true
+}
 
 async function changePassword() {
   if (pwdNew.value.length < 8) {
@@ -70,9 +87,6 @@ async function changePassword() {
       new_password: pwdNew.value,
     })
     if (data.ok) {
-      pwdOld.value = ''
-      pwdNew.value = ''
-      pwdConfirm.value = ''
       pwdMsg.value = { text: 'Password updated. Please sign in again with the new password.', ok: true }
       setTimeout(() => router.push('/login'), 1200)
     } else {
@@ -135,7 +149,7 @@ const groupedRules = computed(() => {
     })
 })
 
-// Modal form state
+// Proxy rule modal form state
 const modal = reactive({
   show: false,
   editingName: '',
@@ -245,44 +259,20 @@ onMounted(() => {
 
 <template>
   <div class="space-y-6 sm:space-y-8">
-    <!-- Token management -->
+    <!-- Account & Token: buttons open the modals -->
     <section class="bg-white rounded-xl p-5 sm:p-6 shadow-sm">
-      <h2 class="text-lg font-semibold mb-1">Token Management</h2>
-      <p class="text-sm text-slate-500 mb-4">All clients use this shared token to authenticate.</p>
-      <div v-if="curToken" class="hidden flex flex-wrap items-center gap-3 mb-4 bg-slate-50 rounded-lg px-4 py-3">
-        <span class="text-sm text-slate-500">Current Token</span>
-        <code class="flex-1 min-w-0 font-mono text-sm text-slate-700 break-all">{{ curToken }}</code>
-        <button class="text-sm text-emerald-700 hover:text-emerald-900 font-medium" @click="copyText(curToken)">Copy</button>
-      </div>
-      <div class="flex flex-col sm:flex-row gap-3">
-        <input
-          v-model="tokenInput"
-          type="text"
-          placeholder="Leave empty to generate new random token"
-          class="w-full sm:flex-1 border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-500"
-        />
-        <button class="bg-slate-800 text-white px-5 py-2 rounded-lg hover:bg-slate-700" @click="updateToken(false)">Save</button>
-        <button class="bg-slate-200 text-slate-700 px-5 py-2 rounded-lg hover:bg-slate-300" @click="updateToken(true)">Generate Random Token</button>
-      </div>
-      <p v-if="tokenMsg" class="text-sm mt-2" :class="tokenMsg.ok ? 'text-emerald-600' : 'text-red-500'">{{ tokenMsg.text }}</p>
-    </section>
-
-    <!-- Change password -->
-    <section class="bg-white rounded-xl p-5 sm:p-6 shadow-sm">
-      <h2 class="text-lg font-semibold mb-1">Change Password</h2>
+      <h2 class="text-lg font-semibold mb-1">Account & Token</h2>
       <p class="text-sm text-slate-500 mb-4">
-        Update the admin login password. After changing it, all active sessions will be logged out and you must sign in again.
+        Manage the admin login password and the shared tunnel authentication token.
       </p>
-      <div class="space-y-3">
-        <input v-model="pwdOld" type="password" autocomplete="current-password" placeholder="Current password"
-          class="w-full border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-500" />
-        <input v-model="pwdNew" type="password" autocomplete="new-password" placeholder="New password (at least 8 characters)"
-          class="w-full border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-500" />
-        <input v-model="pwdConfirm" type="password" autocomplete="new-password" placeholder="Confirm new password"
-          class="w-full border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-500" />
+      <div class="flex flex-col sm:flex-row gap-3">
+        <button class="bg-slate-800 text-white px-5 py-2 rounded-lg hover:bg-slate-700" @click="openTokenModal">
+          Token Management
+        </button>
+        <button class="bg-white border border-slate-200 px-5 py-2 rounded-lg hover:bg-slate-50" @click="openPwdModal">
+          Change Password
+        </button>
       </div>
-      <button class="mt-4 bg-slate-800 text-white px-5 py-2 rounded-lg hover:bg-slate-700" @click="changePassword">Update Password</button>
-      <p v-if="pwdMsg" class="text-sm mt-2" :class="pwdMsg.ok ? 'text-emerald-600' : 'text-red-500'">{{ pwdMsg.text }}</p>
     </section>
 
     <!-- Config hot reload -->
@@ -337,6 +327,58 @@ onMounted(() => {
       </div>
     </div>
 
+    <!-- Token management modal -->
+    <div v-if="tokenModal" class="fixed inset-0 z-50 bg-black/40 flex items-center justify-center" @click.self="tokenModal = false">
+      <div class="bg-white rounded-xl shadow-xl w-full max-w-md mx-4 p-6">
+        <h3 class="text-lg font-semibold">Token Management</h3>
+        <p class="text-sm text-slate-500 mt-1 mb-4">All clients use this shared token to authenticate.</p>
+
+        <div class="flex flex-wrap items-center gap-3 mb-4 bg-slate-50 rounded-lg px-4 py-3">
+          <span class="text-sm text-slate-500">Current Token</span>
+          <code class="flex-1 min-w-0 font-mono text-sm text-slate-700 break-all">{{ curToken || '-' }}</code>
+          <button class="text-sm text-emerald-700 hover:text-emerald-900 font-medium" @click="copyText(curToken)">Copy</button>
+        </div>
+
+        <input
+          v-model="tokenInput"
+          type="text"
+          placeholder="Leave empty to generate new random token"
+          class="w-full border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-500"
+        />
+
+        <p v-if="tokenMsg" class="text-sm mt-2" :class="tokenMsg.ok ? 'text-emerald-600' : 'text-red-500'">{{ tokenMsg.text }}</p>
+
+        <div class="mt-5 flex flex-col-reverse sm:flex-row justify-end gap-3">
+          <button class="bg-slate-200 text-slate-700 px-5 py-2 rounded-lg hover:bg-slate-300" @click="tokenModal = false">Close</button>
+          <button class="bg-slate-200 text-slate-700 px-5 py-2 rounded-lg hover:bg-slate-300" @click="updateToken(true)">Generate Random</button>
+          <button class="bg-slate-800 text-white px-5 py-2 rounded-lg hover:bg-slate-700" @click="updateToken(false)">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Change password modal -->
+    <div v-if="pwdModal" class="fixed inset-0 z-50 bg-black/40 flex items-center justify-center" @click.self="pwdModal = false">
+      <div class="bg-white rounded-xl shadow-xl w-full max-w-md mx-4 p-6">
+        <h3 class="text-lg font-semibold">Change Password</h3>
+        <p class="text-sm text-slate-500 mt-1 mb-4">
+          After changing it, all active sessions will be logged out and you must sign in again.
+        </p>
+        <div class="space-y-3">
+          <input v-model="pwdOld" type="password" autocomplete="current-password" placeholder="Current password"
+            class="w-full border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-500" />
+          <input v-model="pwdNew" type="password" autocomplete="new-password" placeholder="New password (at least 8 characters)"
+            class="w-full border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-500" />
+          <input v-model="pwdConfirm" type="password" autocomplete="new-password" placeholder="Confirm new password"
+            class="w-full border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-slate-500" />
+        </div>
+        <p v-if="pwdMsg" class="text-sm mt-2" :class="pwdMsg.ok ? 'text-emerald-600' : 'text-red-500'">{{ pwdMsg.text }}</p>
+        <div class="mt-5 flex flex-col-reverse sm:flex-row justify-end gap-3">
+          <button class="bg-slate-200 text-slate-700 px-5 py-2 rounded-lg hover:bg-slate-300" @click="pwdModal = false">Cancel</button>
+          <button class="bg-slate-800 text-white px-5 py-2 rounded-lg hover:bg-slate-700" @click="changePassword">Update Password</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Proxy rule modal -->
     <div v-if="modal.show" class="fixed inset-0 z-50 bg-black/40 flex items-center justify-center" @click.self="closeProxyModal">
       <div class="bg-white rounded-xl shadow-xl w-full max-w-md mx-4 p-6">
@@ -360,7 +402,7 @@ onMounted(() => {
             :class="{ 'border-red-400': modal.fieldErr.target }" />
         </div>
         <p class="text-sm mt-2 text-red-500">{{ modal.msg }}</p>
-        <div class="mt-5 flex justify-end gap-3">
+        <div class="mt-5 flex flex-col-reverse sm:flex-row justify-end gap-3">
           <button class="bg-slate-200 text-slate-700 px-5 py-2 rounded-lg hover:bg-slate-300" @click="closeProxyModal">Cancel</button>
           <button class="bg-slate-800 text-white px-5 py-2 rounded-lg hover:bg-slate-700" @click="submitProxy">
             {{ modal.editingName ? 'Save' : 'Create' }}

@@ -184,7 +184,13 @@ impl Client {
                     FrameType::StreamOpen => {
                         let sid = frame.stream_id;
                         match parse_stream_open_payload(&frame.payload) {
-                            Ok(target) => {
+                            Ok((target, peer)) => {
+                                info!(
+                                    "new tunnel connection: peer={} service={} stream_id={}",
+                                    if peer.is_empty() { "unknown" } else { &peer },
+                                    target,
+                                    sid
+                                );
                                 match tokio::net::TcpStream::connect(&target).await {
                                     Ok(local) => {
                                         // Connected: reply ack + create stream + spawn forward
