@@ -2,10 +2,17 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import tailwindcss from '@tailwindcss/vite'
 import { fileURLToPath, URL } from 'node:url'
+import { getBuildVersion } from './get-version.ts'
 
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [vue(), tailwindcss()],
+  define: {
+    // define values are injected as raw JS code, so the version string must be
+    // wrapped as a quoted string literal via JSON.stringify; otherwise a bare
+    // "1.1.1" is not a valid JS expression and rolldown fails the build.
+    'import.meta.env.VITE_BUILD_VERSION': JSON.stringify(getBuildVersion()),
+  },
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),
@@ -24,7 +31,7 @@ export default defineConfig({
     rollupOptions: {
       output: {
         // Merge lazy-loaded routes into the single entry chunk
-        inlineDynamicImports: true,
+        codeSplitting: false,
         entryFileNames: 'assets/zorv-[hash].js',
         assetFileNames: (assetInfo) => {
           if (assetInfo.name?.endsWith('.css')) return 'assets/zorv-[hash].css'

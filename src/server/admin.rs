@@ -948,6 +948,9 @@ async fn api_kick(req: &HttpRequest, state: &AdminState) -> Response {
 
     // Remove the session: after the kick, no new streams are accepted for this client_id (the connection closes itself once the client exits)
     state.manager.unregister(&kreq.client_id);
+    // Record the kick so an immediate re-connect handshake (e.g. an auto-restart by a
+    // service manager) is rejected within the kick window.
+    state.manager.mark_kicked(&kreq.client_id).await;
     audit(state, &req.ip, "kick", &format!("client_id={}", kreq.client_id));
     info!("kicked client: {}", kreq.client_id);
     json_response("200 OK", json_ok())
@@ -1273,7 +1276,14 @@ mod tests {
         assert!(verify_password("secret", &hash));
         assert!(!verify_password("wrong", &hash));
         // A corrupted hash must fail verificationd hash must fail verification
-        let broken = format!("{}0", &hash[..hash.len() - 1]);
+        // Flip the last hex char to its opposite so the broken string always differs from the hash
+        // (replacing with a fixed '0' would randomly pass when the last char already is '0').
+        let broken = format!(
+            "{}{}",
+            &hash[..hash.len() - 1],
+            if hash.ends_with('0') { '1' } else { '0' }
+        );
+        assert_ne!(broken, hash);
         assert!(!verify_password("secret", &broken));
     }
 

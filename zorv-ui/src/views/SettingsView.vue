@@ -129,13 +129,18 @@ function groupKey(rule: ProxyRule): string {
   return rule.client_id || UNBOUND_KEY
 }
 
-// Group rules by client_id, unbound rules always sorted last
+// Group rules by client_id, unbound rules always sorted last.
+// Online clients without any rule are also merged in, so a newly-online
+// client gets a config card (0 rules) on the settings page.
 const groupedRules = computed(() => {
   const groups = new Map<string, ProxyRule[]>()
   for (const rule of rules.value) {
     const key = groupKey(rule)
     if (!groups.has(key)) groups.set(key, [])
     groups.get(key)!.push(rule)
+  }
+  for (const cid of onlineClients.value) {
+    if (!groups.has(cid)) groups.set(cid, [])
   }
   return Array.from(groups.entries())
     .map(([clientId, items]) => ({

@@ -9,6 +9,8 @@
 //! HANDSHAKE_REQ:
 //!   client_id_len: u16
 //!   client_id: bytes
+//!   version_len: u16
+//!   version: bytes          (the client's Cargo package version, e.g. "1.1.1")
 //!   timestamp: u64 (milliseconds)
 //!   hmac: 32 bytes (HMAC-SHA256(token, timestamp_le_bytes))
 //!   capabilities_len: u16
@@ -24,6 +26,9 @@
 //!   reason_len: u16
 //!   reason: bytes
 //! ```
+//!
+//! The server rejects clients whose `version` differs from its own
+//! (`env!("CARGO_PKG_VERSION")`), see `verify_version`.
 
 use std::io::Cursor;
 
@@ -40,6 +45,7 @@ const HMAC_LEN: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeReq {
     pub client_id: String,
+    pub version: String,
     pub timestamp: u64,
     pub hmac: [u8; 32],
     pub capabilities: String,
@@ -55,6 +61,9 @@ pub struct HandshakeAck {
 
 impl HandshakeReq {
     /// Build a handshake request on the client: take the current timestamp and compute the HMAC with `token`.
+    ///
+    /// The version is filled from the crate's own `CARGO_PKG_VERSION` so the client always
+    /// reports the version it was actually built from.
     pub fn build(client_id: &str, token: &str, capabilities: &str) -> Self {
         let ts = now_millis();
         let ts_bytes = ts.to_le_bytes();
@@ -63,6 +72,7 @@ impl HandshakeReq {
         arr.copy_from_slice(&hmac);
         Self {
             client_id: client_id.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             timestamp: ts,
             hmac: arr,
             capabilities: capabilities.to_string(),
@@ -72,10 +82,13 @@ impl HandshakeReq {
     /// Encode into payload bytes per the layout.
     pub fn encode_payload(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            2 + self.client_id.len() + 8 + HMAC_LEN + 2 + self.capabilities.len(),
+            2 + self.client_id.len() + 2 + self.version.len() + 8 + HMAC_LEN + 2
+                + self.capabilities.len(),
         );
         buf.put_u16_le(self.client_id.len() as u16);
         buf.put_slice(self.client_id.as_bytes());
+        buf.put_u16_le(self.version.len() as u16);
+        buf.put_slice(self.version.as_bytes());
         buf.put_u64_le(self.timestamp);
         buf.put_slice(&self.hmac);
         buf.put_u16_le(self.capabilities.len() as u16);
@@ -98,6 +111,18 @@ impl HandshakeReq {
         cur.copy_to_slice(&mut id_buf);
         let client_id = String::from_utf8(id_buf)
             .map_err(|e| ZorvError::Other(format!("invalid utf8 in client_id: {}", e)))?;
+
+        if cur.remaining() < 2 {
+            return Err(ZorvError::Protocol(ProtocolError::Incomplete));
+        }
+        let version_len = cur.get_u16_le() as usize;
+        if cur.remaining() < version_len {
+            return Err(ZorvError::Protocol(ProtocolError::Incomplete));
+        }
+        let mut ver_buf = vec![0u8; version_len];
+        cur.copy_to_slice(&mut ver_buf);
+        let version = String::from_utf8(ver_buf)
+            .map_err(|e| ZorvError::Other(format!("invalid utf8 in version: {}", e)))?;
 
         if cur.remaining() < 8 {
             return Err(ZorvError::Protocol(ProtocolError::Incomplete));
@@ -124,6 +149,7 @@ impl HandshakeReq {
 
         Ok(Self {
             client_id,
+            version,
             timestamp,
             hmac,
             capabilities,
@@ -204,6 +230,20 @@ pub fn verify_handshake(req: &HandshakeReq, expected_token: &str) -> Result<()> 
     Ok(())
 }
 
+/// Server-side version gate: the client must run the exact same version as the server.
+///
+/// - Version mismatch → `ZorvError::Auth("version mismatch: client=... server=...")`
+pub fn verify_version(client_version: &str, server_version: &str) -> Result<()> {
+    if client_version == server_version {
+        Ok(())
+    } else {
+        Err(ZorvError::Auth(format!(
+            "version mismatch: client={} server={}",
+            client_version, server_version
+        )))
+    }
+}
+
 /// Build an `AUTH_FAIL` control frame.
 pub fn auth_fail_frame(reason: &str) -> Frame {
     let mut payload = Vec::with_capacity(2 + reason.len());
@@ -243,6 +283,7 @@ mod tests {
         let payload = req.encode_payload();
         let decoded = HandshakeReq::decode_payload(&payload).unwrap();
         assert_eq!(decoded.client_id, req.client_id);
+        assert_eq!(decoded.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(decoded.timestamp, req.timestamp);
         assert_eq!(decoded.hmac, req.hmac);
         assert_eq!(decoded.capabilities, req.capabilities);
@@ -255,6 +296,7 @@ mod tests {
         assert_eq!(frame.frame_type, FrameType::HandshakeReq);
         let parsed = parse_handshake_req(&frame).unwrap();
         assert_eq!(parsed.client_id, "client-7");
+        assert_eq!(parsed.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(parsed.capabilities, "tcp");
     }
 
@@ -309,12 +351,26 @@ mod tests {
         hmac_arr.copy_from_slice(&hmac_vec);
         let req = HandshakeReq {
             client_id: "client-1".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             timestamp: old_ts,
             hmac: hmac_arr,
             capabilities: "tcp".to_string(),
         };
         let err = verify_handshake(&req, "secret-token").unwrap_err();
         assert!(matches!(err, ZorvError::Auth(_)));
+    }
+
+    #[test]
+    fn verify_version_matches() {
+        let v = env!("CARGO_PKG_VERSION");
+        assert!(verify_version(v, v).is_ok());
+    }
+
+    #[test]
+    fn verify_version_mismatch() {
+        let err = verify_version("9.9.9", env!("CARGO_PKG_VERSION")).unwrap_err();
+        assert!(matches!(err, ZorvError::Auth(_)));
+        assert!(err.to_string().contains("version mismatch"));
     }
 
     #[test]

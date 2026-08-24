@@ -14,7 +14,9 @@ use tracing::{info, warn};
 use crate::common::config::ClientConfig;
 use crate::common::error::{Result, ZorvError};
 use crate::common::tls::build_client_connector;
-use crate::protocol::{parse_handshake_ack, Frame, FrameType, HandshakeAck, HandshakeReq};
+use crate::protocol::{
+    parse_error_payload, parse_handshake_ack, Frame, FrameType, HandshakeAck, HandshakeReq,
+};
 
 /// Initial buffer capacity for the reader.
 const READ_BUF_CAP: usize = 16 * 1024;
@@ -102,7 +104,13 @@ pub async fn dial_and_handshake(
             info!("handshake ack: session={}", ack.session_id);
             Ok((tls_stream, ack))
         }
-        FrameType::AuthFail => Err(ZorvError::Auth("rejected by server".to_string())),
+        FrameType::AuthFail => {
+            // Rejected by the server (bad token / version mismatch / kicked re-connect).
+            // Surface the server's reason so the operator can see, e.g., a version mismatch.
+            let reason = parse_error_payload(&first_frame.payload)
+                .unwrap_or_else(|_| "rejected by server".to_string());
+            Err(ZorvError::Auth(reason))
+        }
         other => Err(ZorvError::Other(format!(
             "unexpected handshake response frame type: {:?}",
             other

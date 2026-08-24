@@ -26,8 +26,8 @@ use crate::common::crypto::now_millis;
 use crate::common::error::Result;
 use crate::protocol::{
     auth_fail_frame, build_stream_close, heartbeat_ack_frame, parse_handshake_req,
-    parse_stream_open_ack_payload, parse_timestamp, parse_udp_datagram, HandshakeAck, Frame,
-    FrameType, StreamIdAllocator,
+    parse_stream_open_ack_payload, parse_timestamp, parse_udp_datagram, verify_version,
+    HandshakeAck, Frame, FrameType, StreamIdAllocator,
 };
 use crate::server::auth::{authenticate, validate_client_id};
 use crate::server::manager::{TunnelManager, TunnelSession};
@@ -40,6 +40,8 @@ const READ_BUF_CAP: usize = 16 * 1024;
 const FRAME_CHANNEL_BUF: usize = 1024;
 /// Idle monitor polling interval (seconds).
 const IDLE_CHECK_INTERVAL_SECS: u64 = 5;
+/// Re-connect rejection window for a kicked client (seconds).
+const KICK_REJECT_WINDOW_SECS: u64 = 60;
 
 /// Handles a single client tunnel connection.
 ///
@@ -107,6 +109,27 @@ pub async fn run_tunnel(
     if !validate_client_id(&client_id) {
         warn!("rejected invalid client_id: {:?}", client_id);
         let fail = auth_fail_frame("invalid client_id");
+        let mut enc = BytesMut::new();
+        fail.encode(&mut enc);
+        let _ = write_half.write_all(&enc).await;
+        return Ok(());
+    }
+
+    // Reject a kicked client's immediate re-connect (e.g. an auto-restart by a service manager),
+    // so the kick actually takes effect instead of the client re-joining right away.
+    if manager.is_kicked(&client_id, KICK_REJECT_WINDOW_SECS).await {
+        warn!("rejected kicked client re-connect: {:?}", client_id);
+        let fail = auth_fail_frame("已被管理员踢出");
+        let mut enc = BytesMut::new();
+        fail.encode(&mut enc);
+        let _ = write_half.write_all(&enc).await;
+        return Ok(());
+    }
+
+    // Version gate: only clients running the exact same version may connect.
+    if let Err(e) = verify_version(&handshake_req.version, env!("CARGO_PKG_VERSION")) {
+        warn!("rejected client with version mismatch: client={}", client_id);
+        let fail = auth_fail_frame(&e.to_string());
         let mut enc = BytesMut::new();
         fail.encode(&mut enc);
         let _ = write_half.write_all(&enc).await;

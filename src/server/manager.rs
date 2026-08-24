@@ -4,6 +4,7 @@
 //! `TunnelSession` holds the tunnel frame sender, the business-stream data channel table, the pending STREAM_OPEN table,
 //! the server-side Stream ID allocator, and the last-activity timestamp.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use serde::Serialize;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, RwLock};
 
 use crate::common::crypto::now_millis;
 use crate::protocol::{Frame, StreamIdAllocator};
@@ -86,6 +87,12 @@ impl TunnelSession {
 /// Tunnel session manager: `client_id → Arc<TunnelSession>`.
 pub struct TunnelManager {
     sessions: DashMap<String, Arc<TunnelSession>>,
+    /// Kick blacklist: `client_id → kicked_at (millis)`.
+    ///
+    /// A kicked client's re-connect handshake is rejected within the rejection window,
+    /// so a client auto-restarted by a service manager (systemd/Docker) cannot
+    /// immediately re-join and make the kick appear ineffective.
+    kicked: RwLock<HashMap<String, u64>>,
 }
 
 /// Online client snapshot (for admin UI JSON serialization).
@@ -101,6 +108,27 @@ impl TunnelManager {
     pub fn new() -> Self {
         Self {
             sessions: DashMap::new(),
+            kicked: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Records a kick for `client_id` at the current time.
+    pub async fn mark_kicked(&self, client_id: &str) {
+        self.kicked
+            .write()
+            .await
+            .insert(client_id.to_string(), now_millis());
+    }
+
+    /// Whether `client_id` was kicked within the last `window_secs`.
+    ///
+    /// Used during the tunnel handshake to reject a kicked client's immediate
+    /// re-connect (e.g. an auto-restart by a service manager).
+    pub async fn is_kicked(&self, client_id: &str, window_secs: u64) -> bool {
+        let kicked = self.kicked.read().await;
+        match kicked.get(client_id) {
+            Some(ts) => now_millis().saturating_sub(*ts) <= window_secs.saturating_mul(1000),
+            None => false,
         }
     }
 
@@ -219,6 +247,18 @@ mod tests {
         let removed = mgr.unregister("c1");
         assert!(removed.is_some());
         assert!(mgr.get("c1").is_none());
+    }
+
+    #[tokio::test]
+    async fn kick_blacklist_blocks_reconnect_within_window() {
+        let mgr = TunnelManager::new();
+        // Not kicked yet: allowed.
+        assert!(!mgr.is_kicked("c1", 60).await);
+        // After a kick: rejected within the window.
+        mgr.mark_kicked("c1").await;
+        assert!(mgr.is_kicked("c1", 60).await);
+        // A different client is unaffected.
+        assert!(!mgr.is_kicked("c2", 60).await);
     }
 
     #[test]

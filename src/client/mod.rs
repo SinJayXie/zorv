@@ -41,6 +41,14 @@ const FRAME_CHANNEL_BUF: usize = 1024;
 /// Data channel buffer per business stream.
 const STREAM_DATA_CHANNEL_BUF: usize = 128;
 
+/// Result of one connection lifecycle, deciding whether `run` should reconnect.
+enum RunOutcome {
+    /// Normal disconnect/error path: the caller should back off and reconnect.
+    Reconnect,
+    /// Kicked by the server: terminate the client process (no reconnect).
+    Terminate,
+}
+
 /// Client entry point.
 pub struct Client {
     config: ClientConfig,
@@ -57,6 +65,7 @@ impl Client {
     /// - After each reconnect `delay *= backoff_factor`, clamped to `[initial, max_delay]`.
     /// - Errors from `run_once` are logged but do not terminate the loop
     ///   (unless `max_retries` is reached).
+    /// - Being kicked by the server terminates the loop: the client exits instead of reconnecting.
     pub async fn run(&self) -> anyhow::Result<()> {
         let reconnect = &self.config.reconnect;
         let initial = parse_duration_secs(&reconnect.initial_delay)?;
@@ -65,7 +74,11 @@ impl Client {
         let mut attempts = 0u32;
         loop {
             match self.run_once().await {
-                Ok(()) => info!("client run_once ended"),
+                Ok(RunOutcome::Terminate) => {
+                    info!("client terminated by server kick");
+                    return Ok(());
+                }
+                Ok(RunOutcome::Reconnect) => info!("client run_once ended"),
                 Err(e) => warn!("client run_once error: {}", e),
             }
             // Reconnect check: max_retries=0 means reconnect forever
@@ -83,8 +96,9 @@ impl Client {
 
     /// One full connection lifecycle: dial → handshake → read/write loop → cleanup → return.
     ///
-    /// After returning, `run` handles the backoff and reconnection.
-    async fn run_once(&self) -> Result<()> {
+    /// Returns `Terminate` when the server kicks the client (the caller must not reconnect);
+    /// otherwise `Reconnect` after the session ends, and `run` handles the backoff.
+    async fn run_once(&self) -> Result<RunOutcome> {
         let (tls_stream, ack) = dialer::dial_and_handshake(&self.config).await?;
         let hb_min = ack.heartbeat_min;
         let hb_max = ack.heartbeat_max;
@@ -249,11 +263,12 @@ impl Client {
                         }
                     }
                     FrameType::Error => {
-                        // Kicked by the server: print the reason and exit (no reconnect)
+                        // Kicked by the server: print the reason and terminate the client
+                        // (no reconnect, unlike a plain disconnect).
                         let reason = parse_error_payload(&frame.payload)
                             .unwrap_or_else(|_| "unknown".to_string());
                         warn!("kicked by server: {}", reason);
-                        std::process::exit(0);
+                        return Ok(RunOutcome::Terminate);
                     }
                     _ => {
                         // Other frames (HandshakeReq/HandshakeAck/AuthFail/StreamOpenAck/
@@ -298,6 +313,6 @@ impl Client {
         drop(frame_tx);
         let _ = writer.await;
         info!("client tunnel session ended");
-        Ok(())
+        Ok(RunOutcome::Reconnect)
     }
 }
