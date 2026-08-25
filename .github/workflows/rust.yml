@@ -17,7 +17,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  # Native build + full test suite, with the Vue admin console embedded.
+  test:
     runs-on: ubuntu-latest
 
     steps:
@@ -63,3 +64,152 @@ jobs:
         run: cargo test --verbose
         env:
           ZORV_SKIP_UI_BUILD: "1"
+
+  # Release builds for Windows x64 and Linux x64 / 32-bit / arm64.
+  # Runs on pushes to master only; produces zipped binary artifacts.
+  build-release:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+            cross: false
+          - os: ubuntu-latest
+            target: i686-unknown-linux-gnu
+            platform: linux-i686
+            cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            platform: linux-aarch64
+            cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: win-x86_64
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable) with target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Install the cross C toolchain (aarch64 / i686 multilib) and wire up the
+      # CC/AR/linker env vars that build.rs & the `cc` crate (ring) need.
+      - name: Set up cross-compilation toolchain
+        if: matrix.cross
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Cache Cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: zorv-ui/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: zorv-ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend (Vue admin console)
+        working-directory: zorv-ui
+        run: pnpm build
+
+      # Cross targets cannot run tests on this runner, so this job only builds.
+      - name: Build release (${{ matrix.target }})
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          ZORV_SKIP_UI_BUILD: "1"
+
+      - name: Extract version from Cargo.toml
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      # Package both binaries into a single zorv-<version>-<platform>.zip
+      - name: Package binaries (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: target/${{ matrix.target }}/release
+        run: |
+          zip -j "$GITHUB_WORKSPACE/zorv-${{ steps.version.outputs.tag }}-${{ matrix.platform }}.zip" zorv zorvd
+
+      - name: Package binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: target/${{ matrix.target }}/release
+        run: |
+          Compress-Archive -Path zorv.exe,zorvd.exe -DestinationPath "$env:GITHUB_WORKSPACE\zorv-${{ steps.version.outputs.tag }}-${{ matrix.platform }}.zip" -Force
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: zorv-${{ matrix.platform }}
+          path: zorv-${{ steps.version.outputs.tag }}-${{ matrix.platform }}.zip
+          if-no-files-found: error
+
+  # Publish the built binaries to a GitHub Release tagged with the crate version
+  # (e.g. v1.1.2). Skips when a release for that tag already exists.
+  release:
+    needs: build-release
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: zorv-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Zorv ${{ steps.version.outputs.tag }}
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
