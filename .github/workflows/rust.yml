@@ -1,0 +1,65 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # Cache the cargo registry + target dir across runs
+      - name: Cache Cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: zorv-ui/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: zorv-ui
+        run: pnpm install --frozen-lockfile
+
+      # Build the Vue admin console first so the `html/` output exists before
+      # cargo build embeds it (build.rs collects `html/` at compile time).
+      - name: Build frontend (Vue admin console)
+        working-directory: zorv-ui
+        run: pnpm build
+
+      # ZORV_SKIP_UI_BUILD=1: the frontend is already built above, so build.rs
+      # skips its own `pnpm build` subprocess and only embeds `html/`.
+      - name: Build
+        run: cargo build --verbose
+        env:
+          ZORV_SKIP_UI_BUILD: "1"
+
+      - name: Run tests
+        run: cargo test --verbose
+        env:
+          ZORV_SKIP_UI_BUILD: "1"
