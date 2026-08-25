@@ -132,16 +132,24 @@ impl TunnelManager {
         }
     }
 
-    /// Registers (or replaces) a session.
+    /// Registers a session **only if** no session for this `client_id` already exists.
     ///
-    /// If a session with the same client_id already exists, the old session's Arc reference is replaced out of the table;
-    /// its frame_tx clones are dropped as well. However, the old writer task may still hold the rx,
-    /// so the caller must close it separately (the MVP accepts that the old writer is reaped
-    /// by the idle monitor or a socket disconnect).
-    pub fn register(&self, session: Arc<TunnelSession>) {
+    /// Returns `true` when the session was inserted, `false` when the client is already
+    /// online (the new session is not registered and must be rejected).
+    ///
+    /// The insertion is atomic (DashMap entry lock), so two simultaneous handshakes with
+    /// the same `client_id` cannot both register.
+    pub fn register(&self, session: Arc<TunnelSession>) -> bool {
         let client_id = session.client_id.clone();
-        if let Some(_old) = self.sessions.insert(client_id, session) {
-            tracing::warn!("replaced existing tunnel session");
+        match self.sessions.entry(client_id) {
+            dashmap::Entry::Occupied(_) => {
+                tracing::warn!("reject duplicate session: client already online");
+                false
+            }
+            dashmap::Entry::Vacant(v) => {
+                v.insert(session);
+                true
+            }
         }
     }
 
@@ -241,7 +249,7 @@ mod tests {
     fn register_get_unregister() {
         let mgr = TunnelManager::new();
         assert!(mgr.get("c1").is_none());
-        mgr.register(make_dummy_session("c1"));
+        assert!(mgr.register(make_dummy_session("c1")));
         assert!(mgr.get("c1").is_some());
         assert!(mgr.get("c2").is_none());
         let removed = mgr.unregister("c1");
@@ -262,14 +270,17 @@ mod tests {
     }
 
     #[test]
-    fn register_replaces_existing() {
+    fn register_rejects_duplicate_online_client() {
         let mgr = TunnelManager::new();
-        mgr.register(make_dummy_session("c1"));
-        mgr.register(make_dummy_session("c1"));
+        // First registration succeeds and stays registered.
+        assert!(mgr.register(make_dummy_session("c1")));
+        // A second connection with the same client_id is rejected.
+        assert!(!mgr.register(make_dummy_session("c1")));
         assert!(mgr.get("c1").is_some());
-        // Table is empty after unregister
+        // After the client goes offline, registration is allowed again.
         mgr.unregister("c1");
         assert!(mgr.get("c1").is_none());
+        assert!(mgr.register(make_dummy_session("c1")));
     }
 
     #[test]
@@ -277,16 +288,17 @@ mod tests {
         let mgr = TunnelManager::new();
         let old = make_dummy_session_with_id("c1", "sid-old");
         let new = make_dummy_session_with_id("c1", "sid-new");
-        mgr.register(Arc::clone(&old));
-        mgr.register(Arc::clone(&new));
+        // The first session registers; the second (same client_id) is rejected as already online.
+        assert!(mgr.register(Arc::clone(&old)));
+        assert!(!mgr.register(Arc::clone(&new)));
         assert!(mgr.get("c1").is_some());
 
-        // Old session (no longer in the table) cleanup: must not delete the new session.
-        assert!(mgr.unregister_if_current(&old).is_none());
-        assert!(mgr.get("c1").is_some(), "old session must not remove the new session");
+        // The rejected (never registered) session must not be removable by its own id.
+        assert!(mgr.unregister_if_current(&new).is_none());
+        assert!(mgr.get("c1").is_some(), "rejected session must not affect the online one");
 
-        // New session's own cleanup: removed normally.
-        let removed = mgr.unregister_if_current(&new);
+        // The registered session's own cleanup removes it normally.
+        let removed = mgr.unregister_if_current(&old);
         assert!(removed.is_some());
         assert!(mgr.get("c1").is_none());
     }

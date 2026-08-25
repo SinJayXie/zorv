@@ -941,7 +941,7 @@ async fn api_kick(req: &HttpRequest, state: &AdminState) -> Response {
         None => return json_err_response("404 Not Found", "client not online"),
     };
 
-    let frame = crate::protocol::build_error_frame("已被管理员踢出");
+    let frame = crate::protocol::build_error_frame("Kicked by admin");
     if session.frame_tx.send(frame).await.is_err() {
         return json_err_response("409 Conflict", "tunnel closed");
     }
@@ -1141,11 +1141,20 @@ async fn api_audit(query: &str, state: &AdminState) -> Response {
 
     let mut page = 1usize;
     let mut page_size = 50usize;
+    // Optional filters: exact `action`, `ip` substring, `from`/`to` time range (ms since epoch)
+    let mut action = String::new();
+    let mut ip = String::new();
+    let mut from: Option<u64> = None;
+    let mut to: Option<u64> = None;
     for kv in query.split('&') {
         if let Some((k, v)) = kv.split_once('=') {
             match k {
                 "page" => page = v.parse().unwrap_or(1),
                 "page_size" => page_size = v.parse().unwrap_or(50),
+                "action" => action = v.to_string(),
+                "ip" => ip = v.to_string(),
+                "from" => from = v.parse().ok(),
+                "to" => to = v.parse().ok(),
                 _ => {}
             }
         }
@@ -1155,7 +1164,19 @@ async fn api_audit(query: &str, state: &AdminState) -> Response {
     }
     page_size = page_size.clamp(1, 200);
 
-    let all = state.audit_logs.snapshot();
+    let mut all = state.audit_logs.snapshot();
+    if !action.is_empty() {
+        all.retain(|e| e.action == action);
+    }
+    if !ip.is_empty() {
+        all.retain(|e| e.ip.contains(&ip));
+    }
+    if let Some(f) = from {
+        all.retain(|e| e.ts_ms >= f);
+    }
+    if let Some(t) = to {
+        all.retain(|e| e.ts_ms <= t);
+    }
     let total = all.len();
     let start = (page - 1) * page_size;
     let items = if start >= total {
@@ -1475,6 +1496,46 @@ mod tests {
         let resp = route(&req("GET", "/api/audit?page=99&page_size=2", vec![]), &state).await;
         let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
         assert!(v["items"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_audit_filters_by_action_ip_and_time() {
+        let state = make_state();
+        state.audit_logs.record("10.0.0.1", "login", "ok user=admin");
+        state.audit_logs.record("10.0.0.2", "proxy_connect", "proxy=web target=127.0.0.1:80");
+        state.audit_logs.record("192.168.1.5", "kick", "client_id=test-app");
+
+        // Exact action filter
+        let resp = route(&req("GET", "/api/audit?action=proxy_connect", vec![]), &state).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["items"][0]["action"], "proxy_connect");
+
+        // IP substring filter
+        let resp = route(&req("GET", "/api/audit?ip=10.0.0", vec![]), &state).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["total"], 2);
+
+        // Time range: `from` in the future matches nothing, `to` in the past matches nothing
+        let future = crate::common::crypto::now_millis() + 60_000;
+        let resp = route(&req("GET", &format!("/api/audit?from={future}"), vec![]), &state).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["total"], 0);
+
+        let resp = route(&req("GET", "/api/audit?to=1", vec![]), &state).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["total"], 0);
+
+        // A wide window covers all entries
+        let resp = route(&req("GET", "/api/audit?from=0&to=9999999999999", vec![]), &state).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["total"], 3);
+
+        // Combined filters
+        let resp = route(&req("GET", "/api/audit?ip=10.0.0&action=login", vec![]), &state).await;
+        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["items"][0]["ip"], "10.0.0.1");
     }
 
     #[tokio::test]

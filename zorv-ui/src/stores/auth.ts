@@ -12,6 +12,7 @@ interface LoginResult {
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     token: getToken(),
+    username: localStorage.getItem('zorv_username') ?? '',
   }),
   getters: {
     isAuthed: (s) => !!s.token,
@@ -27,6 +28,8 @@ export const useAuthStore = defineStore('auth', {
         })
         if (data.ok && data.token) {
           this.token = data.token
+          this.username = username
+          localStorage.setItem('zorv_username', username)
           setToken(data.token)
           return { ok: true, token: data.token }
         }
@@ -44,12 +47,16 @@ export const useAuthStore = defineStore('auth', {
         // Ignore network errors; local logout still happens
       }
       this.token = ''
+      this.username = ''
       clearToken()
+      localStorage.removeItem('zorv_username')
     },
     /** Local clear (e.g. after a 401) */
     clear(): void {
       this.token = ''
+      this.username = ''
       clearToken()
+      localStorage.removeItem('zorv_username')
     },
   },
 })

@@ -112,15 +112,27 @@ impl Client {
         let udp_manager: Arc<udp::UdpManager> = Arc::new(udp::UdpManager::new());
         let (rd, wr) = tokio::io::split(tls_stream);
 
+        // Cancel signal: when the main loop ends (normally or by being cancelled/aborted),
+        // `cancel_tx` is dropped/signalled and the writer/heartbeat tasks exit, shutting down
+        // the write half. Without this, cancelling `run_once` would leave a half-open
+        // connection that keeps the client_id occupied on the server.
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
         // Writer task: owns the write half exclusively, encodes frames from frame_rx and writes them out.
-        // Once all frame_tx clones are dropped, frame_rx returns None; the writer shuts down the write half before exiting.
+        // Exits when the channel closes, on write error, or when cancelled (then shuts down the write half).
         // The padding flag is read before spawn (a Copy type) to avoid borrowing self in the closure.
         let padding_enabled = self.config.obfuscation.padding;
         let padding_max = self.config.obfuscation.padding_max;
+        let mut writer_cancel = cancel_rx.clone();
         let writer = tokio::spawn(async move {
             let mut wr = wr;
             let mut buf = BytesMut::with_capacity(READ_BUF_CAP);
-            while let Some(mut frame) = frame_rx.recv().await {
+            loop {
+                let frame = tokio::select! {
+                    f = frame_rx.recv() => f,
+                    _ = writer_cancel.changed() => None,
+                };
+                let Some(mut frame) = frame else { break };
                 if padding_enabled {
                     frame.apply_random_padding(padding_max);
                 }
@@ -144,6 +156,7 @@ impl Client {
         let heartbeat_jitter = self.config.obfuscation.heartbeat_jitter;
         let hb_tx = frame_tx.clone();
         let hb_state_hb = Arc::clone(&hb_state);
+        let mut hb_cancel = cancel_rx.clone();
         let heartbeat = tokio::spawn(async move {
             loop {
                 let interval = {
@@ -154,7 +167,10 @@ impl Client {
                         Duration::from_secs(s.min_sec as u64)
                     }
                 };
-                tokio::time::sleep(interval).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = hb_cancel.changed() => return,
+                }
                 let _ = hb_tx.send(heartbeat_frame()).await;
                 let dead = {
                     let mut s = hb_state_hb.lock().unwrap();
@@ -305,13 +321,15 @@ impl Client {
             }
         }
 
-        // Cleanup: abort heartbeat → clear streams (dropping data_tx makes forward exit) →
-        // drop frame_tx → wait for the writer to exit
-        heartbeat.abort();
+        // Cleanup: notify the writer/heartbeat tasks to exit and await them, so the write
+        // half is shut down and the server sees the disconnect (no half-open connection
+        // occupying the client_id). Clearing streams drops data_tx, making forwards exit.
+        let _ = cancel_tx.send(true);
         streams.clear();
         udp_manager.clear();
         drop(frame_tx);
         let _ = writer.await;
+        let _ = heartbeat.await;
         info!("client tunnel session ended");
         Ok(RunOutcome::Reconnect)
     }

@@ -28,13 +28,15 @@
 - **TCP / UDP 代理**：同时支持端口转发与 UDP 数据报（如 DNS 转发）
 - **流量混淆**：随机 padding 抹平包长分布、心跳间隔随机抖动（`[obfuscation]`）
 - **多客户端**：`client_id` 路由，代理规则与具体客户端绑定
-- **Web 管理台**：Vue 3 SPA（TypeScript + Vite + Tailwind + Pinia + vue-router + axios），在线客户端/总览/设置/流量监控四个页面，移动端自适应，认证走 `Authorization: Bearer <token>` header
+- **Web 管理台**：Vue 3 SPA（TypeScript + Vite + Tailwind + Pinia + vue-router + axios），共 5 个页面（总览 / 在线客户端 / 设置 / 流量监控 / 审计），移动端自适应，认证走 `Authorization: Bearer <token>` header
+  - 经典后台布局：固定左侧导航栏 + 顶部栏（桌面端），移动端折叠为抽屉菜单；内容区限宽 `max-width: 1400px`，响应式栅格（1/2/4 列），表格在手机端折叠为卡片
   - 图形验证码 + 防爆破（单 IP 连续 5 次密码错误锁定 30 分钟）
-  - 应用 Token 管理（支持随机生成 / 复制）、代理规则可视化增删改（弹窗表单 + 输入校验）、修改密码（校验旧密码、强制重新登录）
-  - 在线客户端列表 + 一键踢出（踢出后客户端退出）
-  - 流量监控：按 `client_id` 的 TCP/UDP 上行/下行统计，**落盘持久化** + 30s 采样时序曲线（Canvas 手绘，近 100 分钟）
+  - 应用 Token 管理（支持随机生成 / 一键复制）、代理规则可视化增删改（弹窗表单 + 输入校验）、修改密码（校验旧密码、强制重新登录）
+  - 在线客户端列表：状态点标识、按 Client ID 搜索、会话 ID 复制、一键踢出（确认弹窗 + Toast 反馈，踢出后客户端退出）
+  - 流量监控：按 `client_id` 的 TCP/UDP 上行/下行统计（上行/下行颜色区分），**落盘持久化** + 30s 采样时序曲线（Canvas 手绘），支持时间范围切换（10 分钟 / 1 小时 / 100 分钟）
   - 配置热重载：编辑服务端 `zorvd.toml` 后免重启生效（token 与代理规则差异应用）
-  - 审计日志：登录、token 修改、规则增删改、重载、踢出、穿透连接（哪个公网 IP 访问了哪个服务）均记录，持久化到 `data/audit.log`，管理台提供分页的审计页浏览
+  - 审计日志：登录、token 修改、规则增删改、重载、踢出、穿透连接（哪个公网 IP 访问了哪个服务）均记录，持久化到 `data/audit.log`；审计页支持服务端过滤（动作 / 来源 IP / 时间范围）与详情展开
+  - 破坏性操作（`踢出`、`删除规则`）一律先弹确认框；IP / 端口 / 会话 ID / token / 规则串均提供一键复制按钮
   - 管理台可选用 HTTPS（`[admin.tls]`），密码支持 PBKDF2-HMAC-SHA256 哈希存储
 - **可观测性**：Prometheus `/metrics`（在线客户端/配置规则/活跃流/TCP·UDP 流量计数，免鉴权供抓取）、客户端掉线 Webhook 通知
 - **健壮性**：断线指数退避自动重连、心跳超时清理、重连竞态防护（旧会话清理不会误删新会话）
@@ -231,7 +233,7 @@ powershell -ExecutionPolicy Bypass -File deploy\zorvd-windows-service.ps1
   - `zorv_online_clients`、`zorv_configured_proxies`、`zorv_active_streams`（gauge）
   - `zorv_traffic_{tcp,udp}_{up,down}_bytes_total{client_id="..."}`（counter）
 - **流量历史 API**：`GET /api/traffic/history` 返回 30s 采样的时序历史（近 100 分钟，内存环形缓冲），管理台曲线图即用此数据
-- **审计 API**：`GET /api/audit?page=1&page_size=50` 分页返回审计记录（新在前）：`{total, page, page_size, items}`，供管理台审计页使用
+- **审计 API**：`GET /api/audit?page=1&page_size=50` 分页返回审计记录（新在前）：`{total, page, page_size, items}`；支持服务端过滤参数 `action`（精确匹配）、`ip`（子串匹配）、`from` / `to`（时间范围，毫秒时间戳），供管理台审计页使用
 - **客户端连接日志**：每次隧道建立新穿透流时，客户端控制台打印 `new tunnel connection: peer=<对方IP> service=<目标服务>`
 - **掉线 Webhook**：`[notify] webhook` 配置后，客户端会话结束时 POST JSON `{"event":"offline","client_id":"..."}`
 

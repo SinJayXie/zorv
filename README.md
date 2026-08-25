@@ -30,13 +30,15 @@
 - **TCP / UDP proxying** — port forwarding and UDP datagrams (e.g. DNS forwarding) out of the box.
 - **Traffic obfuscation** — random padding flattens packet-length distribution; random heartbeat jitter (`[obfuscation]`).
 - **Multi-client routing** — `client_id`-based routing; each proxy rule binds to a specific client.
-- **Web admin console** — Vue 3 SPA (TypeScript + Vite + Tailwind + Pinia + vue-router + axios), online clients / overview / settings / traffic monitoring, mobile-responsive; auth via `Authorization: Bearer <token>` header:
+- **Web admin console** — Vue 3 SPA (TypeScript + Vite + Tailwind + Pinia + vue-router + axios), 5 pages (Overview / Online Clients / Settings / Traffic Monitoring / Audit), auth via `Authorization: Bearer <token>` header:
+  - Classic admin layout: fixed left sidebar + top header (desktop), slide-out drawer menu (mobile); content capped at `max-width: 1400px`, mobile-responsive (1/2/4-column grids, tables collapse to cards on phones)
   - Captcha + brute-force protection (5 failed password attempts per IP → 30 min lockout)
-  - Token management (random generation / copy), visual proxy-rule CRUD (modal form + input validation), and password change (old-password verification, forces re-login)
-  - Online client list with one-click **kick** (client exits immediately)
-  - Traffic monitoring per `client_id` with TCP/UDP up/down stats, **persisted to disk** + 30s-sampled time-series curve (hand-drawn Canvas, ~100 minutes)
+  - Token management (random generation / one-click copy), visual proxy-rule CRUD (modal form + input validation), and password change (old-password verification, forces re-login)
+  - Online client list with status dots, search by Client ID, session-ID copy, and one-click **kick** (confirmation modal + toast feedback; client exits immediately)
+  - Traffic monitoring per `client_id` with TCP/UDP up/down stats (upload/download color-coded), **persisted to disk** + 30s-sampled time-series curve (hand-drawn Canvas) with a time-range selector (10 min / 1 hr / 100 min)
   - Hot config reload — edit `zorvd.toml` and it takes effect without a restart (token & proxy-rule diffs applied)
-  - Audit log for login, token changes, rule CRUD, reload, kick, and proxy connection events (which public IP reached which service), persisted to `data/audit.log` and browsable via a paged Audit page
+  - Audit log for login, token changes, rule CRUD, reload, kick, and proxy connection events (which public IP reached which service), persisted to `data/audit.log`; the Audit page supports server-side filters (action / source IP / time range) with expandable detail rows
+  - Destructive actions (`kick`, `delete rule`) always require a confirmation modal; IPs / ports / session IDs / token / rule strings all have one-click copy buttons
   - Optional HTTPS for the console (`[admin.tls]`); passwords stored as PBKDF2-HMAC-SHA256 hashes
 - **Observability** — Prometheus `/metrics` (online clients / configured proxies / active streams / TCP·UDP traffic counters, unauthenticated for scraping), offline webhook notifications.
 - **Robustness** — exponential-backoff auto-reconnect, heartbeat timeout cleanup, and reconnect race protection (cleaning up an old session never removes the new one).
@@ -233,7 +235,7 @@ powershell -ExecutionPolicy Bypass -File deploy\zorvd-windows-service.ps1
   - `zorv_online_clients`, `zorv_configured_proxies`, `zorv_active_streams` (gauges)
   - `zorv_traffic_{tcp,udp}_{up,down}_bytes_total{client_id="..."}` (counters)
 - **Traffic history API** — `GET /api/traffic/history` returns 30s-sampled time-series history (~100 minutes, in-memory ring buffer); the console's curve chart consumes this data.
-- **Audit API** — `GET /api/audit?page=1&page_size=50` returns paged audit entries (newest first): `{total, page, page_size, items}`; consumed by the console's Audit page.
+- **Audit API** — `GET /api/audit?page=1&page_size=50` returns paged audit entries (newest first): `{total, page, page_size, items}`; supports server-side filters `action` (exact), `ip` (substring), `from` / `to` (time range in ms since epoch); consumed by the console's Audit page.
 - **Client connection log** — every time the tunnel opens a new stream, the client prints `new tunnel connection: peer=<caller ip> service=<target service>` to its console.
 - **Offline webhook** — with `[notify] webhook` set, the server POSTs JSON `{"event":"offline","client_id":"..."}` when a client session ends.
 

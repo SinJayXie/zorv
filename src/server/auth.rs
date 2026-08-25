@@ -47,14 +47,15 @@ pub fn ip_allowed(peer_ip: &std::net::IpAddr, allowed: &[String]) -> bool {
 
 /// Validates the `client_id` reported by the client.
 ///
-/// Length is limited to 1..=64, and HTML-dangerous characters and control characters
-/// are disallowed to prevent XSS / injection when it reaches the admin UI.
+/// Naming rules: length 1..=64, and only ASCII letters, digits, `-` and `_` are allowed.
+/// Any special character or whitespace (incl. Chinese/other non-ASCII) is rejected,
+/// which also prevents XSS / injection when the id reaches the admin UI.
 pub fn validate_client_id(id: &str) -> bool {
     if id.is_empty() || id.len() > 64 {
         return false;
     }
-    !id.chars()
-        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>' | '&' | '"' | '\''))
+    id.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 #[cfg(test)]
@@ -75,8 +76,12 @@ mod tests {
 
     #[test]
     fn client_id_validation() {
+        // Allowed: ASCII letters, digits, `-`, `_`.
         assert!(validate_client_id("web-1"));
-        assert!(validate_client_id("客户A"));
+        assert!(validate_client_id("web_1"));
+        assert!(validate_client_id("Client123"));
+        assert!(validate_client_id("a-b_c"));
+        // Rejected: empty, too long, special characters, whitespace, non-ASCII.
         assert!(!validate_client_id(""));
         assert!(!validate_client_id(&"x".repeat(65)));
         assert!(!validate_client_id("a<script>"));
@@ -84,5 +89,10 @@ mod tests {
         assert!(!validate_client_id("a'b"));
         assert!(!validate_client_id("a b"));
         assert!(!validate_client_id("a\nb"));
+        assert!(!validate_client_id("客户A"));
+        assert!(!validate_client_id("a@b"));
+        assert!(!validate_client_id("a.b"));
+        assert!(!validate_client_id("a/b"));
+        assert!(!validate_client_id("a:b"));
     }
 }

@@ -119,7 +119,7 @@ pub async fn run_tunnel(
     // so the kick actually takes effect instead of the client re-joining right away.
     if manager.is_kicked(&client_id, KICK_REJECT_WINDOW_SECS).await {
         warn!("rejected kicked client re-connect: {:?}", client_id);
-        let fail = auth_fail_frame("已被管理员踢出");
+        let fail = auth_fail_frame("Kicked by admin");
         let mut enc = BytesMut::new();
         fail.encode(&mut enc);
         let _ = write_half.write_all(&enc).await;
@@ -140,16 +140,10 @@ pub async fn run_tunnel(
     let server_token = token.read().await.clone();
     match authenticate(&handshake_req, &server_token) {
         Ok(()) => {
-            // 3. Generate a session_id and reply with HandshakeAck
+            // 3. Create the session and register it first: if the client_id is already
+            //    online, the new connection is rejected with AUTH_FAIL instead of
+            //    replacing the existing session.
             let session_id = Uuid::new_v4().to_string();
-            let ack = HandshakeAck::build(&session_id, hb_min, hb_max).into_frame();
-            let mut enc = BytesMut::new();
-            ack.encode(&mut enc);
-            if let Err(e) = write_half.write_all(&enc).await {
-                warn!("write handshake ack failed: {}", e);
-                return Ok(());
-            }
-            // Continue creating the session
             let (frame_tx, frame_rx) = mpsc::channel::<Frame>(FRAME_CHANNEL_BUF);
             let session = Arc::new(TunnelSession {
                 client_id: client_id.clone(),
@@ -165,7 +159,22 @@ pub async fn run_tunnel(
                 udp_rx_bytes: std::sync::atomic::AtomicU64::new(0),
                 udp_tx_bytes: std::sync::atomic::AtomicU64::new(0),
             });
-            manager.register(Arc::clone(&session));
+            if !manager.register(Arc::clone(&session)) {
+                warn!("rejected duplicate client: client={} already online", client_id);
+                let fail = auth_fail_frame("client already online");
+                let mut enc = BytesMut::new();
+                fail.encode(&mut enc);
+                let _ = write_half.write_all(&enc).await;
+                return Ok(());
+            }
+            // Reply with HandshakeAck only after a successful registration.
+            let ack = HandshakeAck::build(&session_id, hb_min, hb_max).into_frame();
+            let mut enc = BytesMut::new();
+            ack.encode(&mut enc);
+            if let Err(e) = write_half.write_all(&enc).await {
+                warn!("write handshake ack failed: {}", e);
+                return Ok(());
+            }
             info!(
                 "tunnel established: client={} session={}",
                 client_id, session_id

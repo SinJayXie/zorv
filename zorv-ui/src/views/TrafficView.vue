@@ -1,5 +1,6 @@
 <script setup lang="ts">
-// Traffic monitoring page: hand-drawn Canvas rate chart + per-client traffic cards
+// Traffic monitoring page: hand-drawn Canvas rate chart (selectable time range)
+// + per-client traffic cards
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import http from '@/api'
 import type { HistorySample, TrafficCounter, TrafficEntry } from '@/types'
@@ -15,6 +16,15 @@ interface Series {
 }
 const chartSeries = ref<Record<string, Series>>({})
 const chartHidden = ref<Record<string, boolean>>({})
+const rawHist = ref<HistorySample[]>([])
+
+// Chart time range (minutes)
+const RANGES = [
+  { label: '10 min', value: 10 },
+  { label: '1 hr', value: 60 },
+  { label: '100 min', value: 100 },
+]
+const range = ref<number>(100)
 
 const PALETTE = [
   '#0284c7', '#059669', '#7c3aed', '#dc2626', '#d97706',
@@ -99,7 +109,7 @@ function drawChart() {
     ctx.fillStyle = '#94a3b8'
     ctx.font = '14px sans-serif'
     ctx.textAlign = 'center'
-    ctx.fillText('No data available, click refresh to load', w / 2, h / 2)
+    ctx.fillText('No data available for this range', w / 2, h / 2)
     return
   }
   maxRate *= 1.1
@@ -154,23 +164,38 @@ function toggleLegend(cid: string) {
   chartHidden.value[cid] = !chartHidden.value[cid]
 }
 
+// Rebuild the visible series from the cached history using the selected range
+function applyRange() {
+  const hist = rawHist.value
+  if (!hist.length) {
+    chartSeries.value = {}
+    drawChart()
+    return
+  }
+  const windowStart = hist[hist.length - 1].ts_ms - range.value * 60 * 1000
+  chartSeries.value = buildRateSeries(hist.filter((s) => s.ts_ms >= windowStart))
+  for (const c of Object.keys(chartSeries.value)) {
+    if (chartHidden.value[c] === undefined) chartHidden.value[c] = false
+  }
+  drawChart()
+}
+
+function setRange(value: number) {
+  range.value = value
+  applyRange()
+}
+
 async function load() {
   try {
     const [hRes, tRes] = await Promise.all([
       http.get<HistorySample[]>('/traffic/history'),
       http.get<TrafficEntry[]>('/traffic'),
     ])
-    const hist = hRes.data
-    const traffic = tRes.data
-
-    chartSeries.value = buildRateSeries(hist)
-    for (const c of Object.keys(chartSeries.value)) {
-      if (chartHidden.value[c] === undefined) chartHidden.value[c] = false
-    }
-    list.value = traffic
+    rawHist.value = hRes.data
+    list.value = tRes.data
     error.value = ''
     loaded.value = true
-    drawChart()
+    applyRange()
   } catch {
     error.value = 'Loading failed'
   }
@@ -194,22 +219,41 @@ onBeforeUnmount(() => {
 
 <template>
   <div>
-    <div class="flex flex-wrap items-center justify-between gap-3 mb-4 sm:mb-6">
-      <h1 class="text-xl sm:text-2xl font-semibold">Traffic Monitoring</h1>
-      <button class="text-sm bg-slate-800 text-white px-4 py-2 rounded-lg hover:bg-slate-700" @click="load">Refresh</button>
+    <div class="flex flex-wrap items-center justify-between gap-3 mb-5 sm:mb-6">
+      <div>
+        <h1 class="text-xl sm:text-2xl font-semibold text-[#1d2129]">Traffic Monitoring</h1>
+        <p class="text-sm text-[#86909c] mt-0.5">Real-time tunnel throughput per client</p>
+      </div>
+      <button
+        class="min-h-11 sm:min-h-10 inline-flex items-center gap-2 bg-slate-800 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-slate-700 transition-colors"
+        @click="load"
+      >
+        Refresh
+      </button>
     </div>
 
-    <div class="bg-white rounded-xl shadow-sm p-4 sm:p-5 mb-6">
-      <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
-        <h2 class="font-semibold">Traffic Monitoring Chart</h2>
-        <span class="text-xs text-slate-400">Last 100 minutes · 30s sampling · Click legend to toggle display</span>
+    <div class="bg-white rounded-xl shadow-sm border border-slate-100 p-4 sm:p-5 mb-6">
+      <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
+        <h2 class="font-semibold text-[#1d2129]">Traffic Monitoring Chart</h2>
+        <div class="flex items-center gap-1 bg-slate-100 rounded-lg p-1">
+          <button
+            v-for="r in RANGES"
+            :key="r.value"
+            class="px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
+            :class="range === r.value ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'"
+            @click="setRange(r.value)"
+          >
+            {{ r.label }}
+          </button>
+        </div>
       </div>
+      <p class="text-xs text-slate-400 mb-2">Last {{ range }} minutes · 30s sampling · Click legend to toggle display</p>
       <canvas ref="canvasRef" class="w-full h-52 sm:h-56"></canvas>
       <div class="mt-3 flex flex-wrap gap-3">
         <button
           v-for="(cid, idx) in Object.keys(chartSeries)"
           :key="cid"
-          class="flex items-center gap-1.5 text-sm text-slate-600 hover:text-slate-900"
+          class="flex items-center gap-1.5 text-sm text-slate-600 hover:text-slate-900 min-h-9"
           :class="chartHidden[cid] ? 'opacity-40 line-through' : ''"
           @click="toggleLegend(cid)"
         >
@@ -220,16 +264,16 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-      <div v-if="!loaded" class="bg-white rounded-xl shadow-sm px-6 py-12 text-center text-slate-400">Loading...</div>
-      <div v-else-if="error" class="bg-white rounded-xl shadow-sm px-6 py-12 text-center text-red-400 md:col-span-2">{{ error }}</div>
-      <div v-else-if="!list.length" class="bg-white rounded-xl shadow-sm px-6 py-12 text-center text-slate-400 md:col-span-2">
+      <div v-if="!loaded" class="bg-white rounded-xl shadow-sm border border-slate-100 px-6 py-12 text-center text-slate-400">Loading...</div>
+      <div v-else-if="error" class="bg-white rounded-xl shadow-sm border border-slate-100 px-6 py-12 text-center text-red-400 md:col-span-2">{{ error }}</div>
+      <div v-else-if="!list.length" class="bg-white rounded-xl shadow-sm border border-slate-100 px-6 py-12 text-center text-slate-400 md:col-span-2">
         No traffic data available, click refresh to load
       </div>
-      <div v-for="t in list" :key="t.client_id" class="bg-white rounded-xl shadow-sm p-4 sm:p-5">
+      <div v-for="t in list" :key="t.client_id" class="bg-white rounded-xl shadow-sm border border-slate-100 p-4 sm:p-5">
         <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
           <span class="font-mono font-semibold text-slate-700 break-all">{{ t.client_id }}</span>
-          <span class="text-xs text-slate-500">
-            <span class="inline-block w-2 h-2 rounded-full mr-1" :class="t.online ? 'bg-emerald-500' : 'bg-slate-300'"></span>
+          <span class="inline-flex items-center gap-1.5 text-xs text-slate-500">
+            <span class="inline-block w-2 h-2 rounded-full" :class="t.online ? 'bg-emerald-500' : 'bg-slate-300'"></span>
             {{ t.online ? 'Online' : 'Offline' }}
           </span>
         </div>
@@ -240,15 +284,15 @@ onBeforeUnmount(() => {
           </div>
           <div class="text-center">
             <div class="text-xs text-slate-400 mb-1">TCP Download</div>
-            <div class="font-mono text-sm sm:text-base font-semibold text-sky-600">{{ fmtBytes(t.tcp_down) }}</div>
+            <div class="font-mono text-sm sm:text-base font-semibold text-emerald-600">{{ fmtBytes(t.tcp_down) }}</div>
           </div>
           <div class="text-center">
             <div class="text-xs text-slate-400 mb-1">UDP Upload</div>
-            <div class="font-mono text-sm sm:text-base font-semibold text-violet-600">{{ fmtBytes(t.udp_up) }}</div>
+            <div class="font-mono text-sm sm:text-base font-semibold text-sky-600">{{ fmtBytes(t.udp_up) }}</div>
           </div>
           <div class="text-center">
             <div class="text-xs text-slate-400 mb-1">UDP Download</div>
-            <div class="font-mono text-sm sm:text-base font-semibold text-violet-600">{{ fmtBytes(t.udp_down) }}</div>
+            <div class="font-mono text-sm sm:text-base font-semibold text-emerald-600">{{ fmtBytes(t.udp_down) }}</div>
           </div>
         </div>
       </div>
