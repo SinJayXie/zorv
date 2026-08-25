@@ -182,6 +182,31 @@ function isValidAddr(s: string): boolean {
   return n >= 1 && n <= 65535
 }
 
+// The public listen field only needs a port: accept a bare port (bound to 0.0.0.0)
+// or a full host:port address for advanced cases.
+function isPort(s: string): boolean {
+  if (!/^\d{1,5}$/.test(s)) return false
+  const n = parseInt(s, 10)
+  return n >= 1 && n <= 65535
+}
+
+function normalizeListen(s: string): string {
+  const t = s.trim()
+  return isPort(t) ? '0.0.0.0:' + t : t
+}
+
+// Pre-fill the form with just the port when binding all interfaces (0.0.0.0),
+// otherwise keep the full host:port unchanged so a custom bind is preserved.
+function listenToInput(listen?: string | null): string {
+  if (!listen) return ''
+  const idx = listen.lastIndexOf(':')
+  if (idx <= 0) return listen
+  const host = listen.slice(0, idx)
+  const port = listen.slice(idx + 1)
+  if (host === '0.0.0.0' && isPort(port)) return port
+  return listen
+}
+
 async function loadAll() {
   try {
     const [pRes, cRes] = await Promise.all([
@@ -201,7 +226,7 @@ function openProxyModal(clientId: string, proxy?: ProxyRule) {
   modal.clientId = clientId
   modal.name = proxy ? proxy.name : ''
   modal.type = proxy ? proxy.type : 'tcp'
-  modal.listen = proxy?.listen || ''
+  modal.listen = listenToInput(proxy?.listen)
   modal.target = proxy?.target || ''
   modal.msg = ''
   modal.fieldErr = { name: false, listen: false, target: false }
@@ -213,13 +238,14 @@ function closeProxyModal() {
 
 async function submitProxy() {
   const name = modal.name.trim()
+  const listenInput = modal.listen.trim()
   // Proxy rule name follows the same naming rules as client_id:
   // 1-64 chars of ASCII letters, digits, `-` and `_` only.
   const errs = {
     name: /^[A-Za-z0-9_-]{1,64}$/.test(name)
       ? ''
       : 'Name must be 1-64 characters using only letters, digits, - and _',
-    listen: isValidAddr(modal.listen.trim()) ? '' : 'Listen address must be host:port (port range 1-65535)',
+    listen: isPort(listenInput) || isValidAddr(listenInput) ? '' : 'Port must be 1-65535, or a full host:port address',
     target: isValidAddr(modal.target.trim()) ? '' : 'Target address must be host:port (port range 1-65535)',
   }
   modal.fieldErr = {
@@ -235,7 +261,7 @@ async function submitProxy() {
     const { data } = await http.post<{ ok: boolean; error?: string }>('/proxies', {
       name,
       type: modal.type,
-      listen: modal.listen.trim(),
+      listen: normalizeListen(modal.listen.trim()),
       client_id: modal.clientId === UNBOUND_KEY ? null : modal.clientId,
       target: modal.target.trim(),
     })
@@ -491,7 +517,7 @@ onMounted(() => {
             <option value="tcp">tcp</option>
             <option value="udp">udp</option>
           </select>
-          <input v-model="modal.listen" maxlength="64" placeholder="Public listen address 0.0.0.0:2222"
+          <input v-model="modal.listen" maxlength="64" placeholder="Public port, e.g. 2222 (binds 0.0.0.0)"
             class="w-full border border-slate-300 rounded-lg px-3 py-2.5 focus:outline-none focus:ring-2 focus:ring-slate-500/40 focus:border-slate-500"
             :class="{ 'border-red-400': modal.fieldErr.listen }" />
           <input v-model="modal.target" maxlength="256" placeholder="Internal target 127.0.0.1:22"
